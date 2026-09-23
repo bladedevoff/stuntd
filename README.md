@@ -1,5 +1,7 @@
 # stuntd: a local Jev-compatible proxy that learns your typed LLM decisions
 
+![stuntd: 90% of your LLM decisions answered locally, in about 20 ms, learned from your own traffic](docs/cover.png)
+
 [![CI](https://github.com/bladedevoff/stuntd/actions/workflows/ci.yml/badge.svg)](https://github.com/bladedevoff/stuntd/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/stuntd.svg)](https://pypi.org/project/stuntd/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
@@ -11,13 +13,6 @@ learns to answer them itself.** It speaks the Jev System One protocol (`POST /v1
 site into a small head on a frozen [Laya](https://huggingface.co/convaiinnovations/laya) encoder,
 and serves that answer locally with calibrated confidence, handing anything it is unsure about back
 to the provider.
-
-![Snake played three ways over the Jev protocol: base Laya zero-shot, the BFS teacher, and the head stuntd trained from the teacher's games](docs/snake-demo.gif)
-
-Same seed, same `typesafe-sdk` client, same daemon. Left: the base Laya checkpoint answering
-zero-shot. Middle: the BFS oracle that plays teacher. Right: the head stuntd trained from the
-teacher's 30 games (138 s), answering 99.6% of the moves itself at 20 ms each. Numbers and
-commands are in [examples/snake/](examples/snake/).
 
 Three ways to run it:
 
@@ -313,6 +308,13 @@ from. Every key is optional and a missing one keeps the default.
 ## Demos
 
 Four runnable demos, each with its own README, its own generated data and its own measured table.
+
+![Snake played three ways over the Jev protocol: base Laya zero-shot, the BFS teacher, and the head stuntd trained from the teacher's games](docs/snake-demo.gif)
+
+Same seed, same `typesafe-sdk` client, same daemon. Left: the base Laya checkpoint answering
+zero-shot. Middle: the BFS oracle that plays teacher. Right: the head stuntd trained from the
+teacher's 30 games (138 s), answering 99.6% of the moves itself at 20 ms each. Numbers and
+commands are in [examples/snake/](examples/snake/).
 
 - [`examples/snake/`](examples/snake/) plays 12x12 Snake over the Jev protocol, one `choice` per
   move. Zero-shot Laya scores 0.70 a game; the head scores 11.40 at `target_agreement = 0.95`,

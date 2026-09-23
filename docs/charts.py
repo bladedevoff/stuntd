@@ -19,11 +19,11 @@ DOCS = Path(__file__).resolve().parent
 WIDTH = 720
 """Width of both charts in pixels, the width README.md renders them at."""
 
-ACCENT = "#2563eb"
-GREY = "#b9c0cc"
-INK = "#1f2933"
-MUTED = "#616b78"
-GRID = "#e4e8ee"
+ACCENT = "#2F5BEA"
+GREY = "#A3ADBF"
+INK = "#14213D"
+MUTED = "#6B7690"
+GRID = "#E1E6EF"
 WHITE = "#ffffff"
 
 
@@ -173,7 +173,7 @@ def _text(
     anchor: str = "start",
 ) -> str:
     return (
-        f'<text x="{x:.1f}" y="{y:.1f}" font-family="sans-serif" font-size="{size}"'
+        f'<text x="{x:.1f}" y="{y:.1f}" font-family="Bahnschrift, DIN Alternate, Segoe UI, sans-serif" font-size="{size}"'
         f' font-weight="{weight}" fill="{fill}" text-anchor="{anchor}">{value}</text>'
     )
 
