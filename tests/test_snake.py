@@ -39,6 +39,25 @@ def test_the_client_refuses_a_run_with_nothing_to_play(argv, capsys, monkeypatch
     assert "must be at least 1" in capsys.readouterr().err
 
 
+def test_the_client_refuses_a_negative_delay(capsys, monkeypatch):
+    assert _load_client(monkeypatch).main(["--delay", "-1"]) == 2
+    assert "cannot be negative" in capsys.readouterr().err
+
+
+def test_show_draws_the_board_and_leaves_the_recorded_moves_alone(capsys, monkeypatch, tmp_path):
+    client = _load_client(monkeypatch)
+    quiet = tmp_path / "quiet.jsonl"
+    loud = tmp_path / "loud.jsonl"
+    argv = ["--teacher", "oracle", "--games", "1", "--max-moves", "5", "--record"]
+    assert client.main([*argv, str(quiet)]) == 0
+    capsys.readouterr()
+    assert client.main([*argv, str(loud), "--show", "--delay", "0"]) == 0
+    shown = capsys.readouterr().out
+    assert loud.read_text(encoding="utf-8") == quiet.read_text(encoding="utf-8")
+    assert "\x1b[2J\x1b[H" in shown
+    assert re.search(r"game 1/1 · move 5 · score \d+ · \d+ ms · teacher", shown)
+
+
 def test_a_move_advances_the_head_and_keeps_the_length():
     game = snake.Game(1)
     game.step("up")

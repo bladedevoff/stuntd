@@ -131,6 +131,15 @@ from the base checkpoint alone.
 | [banking](examples/banking/) | 2 choice | 89.5 / 30.0% | 100.0 / 72.5% | 78% | 75.7 ms |
 | [devtools](examples/devtools/) | choice, noul | 45.0 / 84.5% | 97.0 / 100.0% | 98% | 58.0 ms |
 
+Every decision site of the three text demos, measured against its teacher on held-out requests
+before and after the head was trained:
+
+![Accuracy against the teacher, before and after training, per decision site](docs/before-after.svg)
+
+Snake is scored by what the answers do rather than by how many of them are right:
+
+![Snake average score over 30 games, zero-shot against the heads and the oracle](docs/snake.svg)
+
 Five of the seven sites in the three text demos reach a holdout agreement of 0.95 or better. The
 demos run at the default `target_agreement` of 0.99, which picks each head's operating point rather
 than being a score it reached. The two that fall short, support's `urgency` at 0.935 and banking's
@@ -328,17 +337,23 @@ coverage 0.57. If your decision is really a calculation, write the calculation, 
 - **Free text is not a decision.** stuntd learns closed decisions only: an enum, a boolean or a
   number on the OpenAI path, `choice`, `noul` or `score` on the Jev path. A request that asks for
   prose, a summary or code is relayed and never recorded.
-- **Some decisions need more than the default 3 epochs.** The default stays 3, and the demos
-  train at 24 because each of them measured what that bought. The frozen encoder runs once per
-  site and every epoch reads its cached output, so the extra epochs cost seconds, not minutes.
-  At 3 epochs the same sites answer almost nothing.
+- **A site needs examples.** `training.min_examples` is 300 and the demos use 3000 rows. A rare
+  decision, or one whose option list changes every week, is not a fit.
 - **Overlapping labels make a head defer.** The weakest site of the three text demos is the
   support demo's `urgency`, a four-level `score`. Its levels overlap in wording, so the head
   reaches a 0.935 holdout agreement and answers 71% of the tickets at 99.1% agreement, handing the
   other 29% to the provider. That is a working site rather than a failure, but it is the shape to
   expect when the labels are not cleanly separated by words.
-- **A site needs examples.** `training.min_examples` is 300 and the demos use 3000 rows. A rare
-  decision, or one whose option list changes every week, is not a fit.
+- **Only the OpenAI Chat Completions path learns.** Anthropic Messages, the OpenAI Responses API
+  and Gemini pass through untouched. Claude Code, Codex CLI and Gemini CLI run through stuntd as if
+  it were not there.
+
+### Details worth knowing
+
+- **Some decisions need more than the default 3 epochs.** The default stays 3, and the demos
+  train at 24 because each of them measured what that bought. The frozen encoder runs once per
+  site and every epoch reads its cached output, so the extra epochs cost seconds, not minutes.
+  At 3 epochs the same sites answer almost nothing.
 - **`score` takes 2 to 10 levels and `choice` takes at most 255 options.** Those are stuntd's own
   limits, not a quotation from the Jev API. `instructions` is optional on a question.
 - **A question name is a decision site.** `:` becomes `.`, so `a:b` and `a.b` are one site. Two
@@ -352,9 +367,6 @@ coverage 0.57. If your decision is really a calculation, write the calculation, 
   sampled for a check, `stuntd status` reports `"agreement": null`, and no site is ever demoted.
   `stuntd report`, which measures the head against held-out rows, is the quality signal there. Put
   a Jev provider in front and both come back.
-- **Only the OpenAI Chat Completions path learns.** Anthropic Messages, the OpenAI Responses API
-  and Gemini pass through untouched. Claude Code, Codex CLI and Gemini CLI run through stuntd as if
-  it were not there.
 - **One CUDA workload at a time.** Stop the daemon before `stuntd train`, or the two contend for
   the same GPU.
 - **Every `serve` loads the base checkpoint** when `[jev] upstream` is empty, because local Jev

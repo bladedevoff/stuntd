@@ -95,6 +95,17 @@ reports `"agreement": null` and `stuntd report`, which measures the head against
 held-out rows, is the quality signal here. Put `[jev] upstream` in front of it and both come back:
 the sampled checks are answered by the provider and a head that drifts is demoted on its own.
 
+## Watching it play
+
+`--show` redraws the board after every move and adds one status line: the game, the move, the
+score, the latency and who answered, a trained head, the base checkpoint or the teacher. `--delay`
+is how long each move stays on screen, 0.05 seconds by default, and it does nothing without
+`--show`. The command the recording was made with:
+
+```
+python examples/snake/play.py --teacher none --games 30 --seed 1 --show
+```
+
 ## What it measured
 
 The oracle variant, 30 games from seed 1, 200 moves at most per game, on a laptop RTX 5060 with

@@ -34,6 +34,7 @@ CRITERIA: dict[str, None] = {"up": None, "down": None, "left": None, "right": No
 TIMEOUT = 60.0
 _STUNTD_HEADER = "X-Stuntd"
 _LIVE = "live="
+_CLEAR = "\x1b[2J\x1b[H"
 
 
 @dataclass(frozen=True)
@@ -92,7 +93,33 @@ def _served_by_a_head(answer: SystemOneResponse) -> bool:
     return False
 
 
-def play(game: Game, player: _Oracle | _Daemon, max_moves: int) -> GameResult:
+class _Display:
+    """Redraws the board and one status line in the terminal after every move."""
+
+    def __init__(self, games: int, teacher: str, delay: float) -> None:
+        self._games = games
+        self._otherwise = "teacher" if teacher in ("jev", "oracle") else "zero-shot"
+        self._delay = delay
+        self._game = 0
+
+    def start(self, game_index: int) -> None:
+        self._game = game_index
+
+    def draw(self, game: Game, moves: int, latency_ms: float, from_head: bool) -> None:
+        answered = "head" if from_head else self._otherwise
+        sys.stdout.write(
+            f"{_CLEAR}{board_text(game)}\n"
+            f"game {self._game}/{self._games} · move {moves} · score {game.score}"
+            f" · {latency_ms:.0f} ms · {answered}\n"
+        )
+        sys.stdout.flush()
+        if self._delay:
+            time.sleep(self._delay)
+
+
+def play(
+    game: Game, player: _Oracle | _Daemon, max_moves: int, display: _Display | None = None
+) -> GameResult:
     """Plays one game to its death or to max_moves, whichever comes first."""
     latencies: list[float] = []
     heads = 0
@@ -101,6 +128,8 @@ def play(game: Game, player: _Oracle | _Daemon, max_moves: int) -> GameResult:
         latencies.append(latency_ms)
         heads += int(from_head)
         game.step(move)
+        if display is not None:
+            display.draw(game, len(latencies), latency_ms, from_head)
     return GameResult(game.score, len(latencies), latencies, heads)
 
 
@@ -126,10 +155,13 @@ def _print_totals(results: list[GameResult], teacher: str) -> None:
 
 
 def _play_all(args: argparse.Namespace, player: _Oracle | _Daemon) -> None:
+    display = _Display(args.games, args.teacher, args.delay) if args.show else None
     results = []
     for index in range(args.games):
         game = Game(args.seed + index)
-        result = play(game, player, args.max_moves)
+        if display is not None:
+            display.start(index + 1)
+        result = play(game, player, args.max_moves, display)
         _print_game(index + 1, result)
         results.append(result)
     print()
@@ -143,6 +175,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.games < 1 or args.max_moves < 1:
         print("--games and --max-moves must be at least 1", file=sys.stderr)
+        return 2
+    if args.delay < 0:
+        print("--delay cannot be negative", file=sys.stderr)
         return 2
     if args.teacher != "oracle":
         if args.record:
@@ -183,6 +218,16 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-moves", type=int, default=200, metavar="M", help="moves before a game is cut short"
+    )
+    parser.add_argument(
+        "--show", action="store_true", help="redraw the board in the terminal after every move"
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.05,
+        metavar="S",
+        help="seconds each drawn move stays on screen, with --show only",
     )
     return parser
 
