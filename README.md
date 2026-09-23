@@ -1,6 +1,7 @@
 # stuntd: a local Jev-compatible proxy that learns your typed LLM decisions
 
 [![CI](https://github.com/bladedevoff/stuntd/actions/workflows/ci.yml/badge.svg)](https://github.com/bladedevoff/stuntd/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/stuntd.svg)](https://pypi.org/project/stuntd/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -41,13 +42,10 @@ listed at the end.
 ## Quickstart: local Jev without an API key
 
 ```
-pip install "stuntd[train] @ git+https://github.com/bladedevoff/stuntd"
+pip install "stuntd[train]"
 stuntd config init
 stuntd serve
 ```
-
-stuntd is not on PyPI yet, so the install is from source until the release; after it,
-`pip install "stuntd[train]"`.
 
 `config init` writes a commented `stuntd.toml` with everything at its default, which means no
 OpenAI upstream and no Jev provider. `serve` says so and loads the base checkpoint:
@@ -90,7 +88,7 @@ or write the rows yourself and `stuntd import` them.
 ## Quickstart: OpenAI-compatible proxy that learns
 
 ```
-pip install "stuntd[train] @ git+https://github.com/bladedevoff/stuntd"
+pip install "stuntd[train]"
 stuntd config init
 stuntd serve --upstream https://api.openai.com
 ```
