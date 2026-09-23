@@ -12,6 +12,13 @@ site into a small head on a frozen [Laya](https://huggingface.co/convaiinnovatio
 and serves that answer locally with calibrated confidence, handing anything it is unsure about back
 to the provider.
 
+![Snake played three ways over the Jev protocol: base Laya zero-shot, the BFS teacher, and the head stuntd trained from the teacher's games](docs/snake-demo.gif)
+
+Same seed, same `typesafe-sdk` client, same daemon. Left: the base Laya checkpoint answering
+zero-shot. Middle: the BFS oracle that plays teacher. Right: the head stuntd trained from the
+teacher's 30 games (138 s), answering 99.6% of the moves itself at 20 ms each. Numbers and
+commands are in [examples/snake/](examples/snake/).
+
 Three ways to run it:
 
 - **Local Jev.** No key, no provider, no training. Point `typesafe-sdk` at stuntd and the base Laya

@@ -151,3 +151,7 @@ sample: an earlier run of the same protocol read 12.37 at the 0.95 target and 2.
 head whose holdout was 0.957 rather than 0.955. The 12-epoch figure comes from that same earlier
 tree. The head moves a little on a re-run as well: the same rows retrained at three seeds in the
 devtools demo scored 0.985, 0.978 and 0.973 on its holdout, at coverage 0.98, 0.98 and 0.95.
+
+The animation in the main README is three `--show` transcripts from the same seed, drawn side by
+side: `--teacher none` on an untrained daemon, `--teacher oracle`, and `--teacher none` on the
+daemon after `stuntd train` and `stuntd enable direction`.
