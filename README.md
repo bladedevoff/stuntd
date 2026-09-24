@@ -6,6 +6,7 @@
 [![PyPI](https://img.shields.io/pypi/v/stuntd.svg)](https://pypi.org/project/stuntd/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Hugging Face Space](https://img.shields.io/badge/HF%20Space-try%20it-blue.svg)](https://huggingface.co/spaces/pollix/stuntd)
 
 **stuntd is a local, self-hosted proxy that records the typed decisions your app already makes and
 learns to answer them itself.** It speaks the Jev System One protocol (`POST /v1/systemone`, with
@@ -13,6 +14,9 @@ learns to answer them itself.** It speaks the Jev System One protocol (`POST /v1
 site into a small head on a frozen [Laya](https://huggingface.co/convaiinnovations/laya) encoder,
 and serves that answer locally with calibrated confidence, handing anything it is unsure about back
 to the provider.
+
+**Try it in the browser:** the [Hugging Face Space](https://huggingface.co/spaces/pollix/stuntd)
+puts zero-shot Laya and the heads stuntd trained side by side on three demos, no install.
 
 Three ways to run it:
 
