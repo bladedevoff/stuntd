@@ -110,7 +110,10 @@ def _serving_sites(models: Path) -> list[tuple[str, SiteModel]]:
 
 
 def _serve(args: argparse.Namespace) -> int:
-    settings = _load(args.config, args.upstream, args.port)
+    overrides: dict[str, object] = {"upstream": args.upstream, "port": args.port}
+    if args.lazy:
+        overrides["lazy_load"] = True
+    settings = load_settings(_config_file(args.config), overrides)
     import uvicorn
 
     from stuntd.proxy.app import build_app
@@ -118,16 +121,19 @@ def _serve(args: argparse.Namespace) -> int:
     models = models_path(settings)
     # With learning off no head answers, so the sites on disk serve nothing.
     serving = _serving_sites(models) if settings.learn else []
-    # The base model loads before anything is printed: it takes seconds, and a checkpoint that
-    # will not load must fail the command rather than leave a line promising a proxy that is up.
-    decider = _serve_decider(settings, len(serving))
-    if decider is not None and serving:
-        # The first pass through a freshly loaded model is far slower than the rest, so one site
-        # pays for it here rather than the first caller of whichever site asks first.
-        site, model = serving[0]
-        decider.warm(model, site_dir(models, site) / HEAD_FILE)
-    elif decider is not None:
-        decider.warm_base()
+    lazy = getattr(settings, "lazy_load", False)
+    decider = None
+    if not lazy:
+        # The base model loads before anything is printed: it takes seconds, and a checkpoint that
+        # will not load must fail the command rather than leave a line promising a proxy that is up.
+        decider = _serve_decider(settings, len(serving))
+        if decider is not None and serving:
+            # The first pass through a freshly loaded model is far slower than the rest, so one site
+            # pays for it here rather than the first caller of whichever site asks first.
+            site, model = serving[0]
+            decider.warm(model, site_dir(models, site) / HEAD_FILE)
+        elif decider is not None:
+            decider.warm_base()
     # uvicorn.run never returns while the daemon is up, so a piped stdout needs the lines now.
     listening = f"stuntd listening on http://{settings.host}:{settings.port}"
     if settings.upstream:
@@ -135,9 +141,10 @@ def _serve(args: argparse.Namespace) -> int:
     else:
         print(listening, flush=True)
         print("no upstream: only the Jev routes are served", flush=True)
-    if decider is not None:
+    if decider is not None or lazy:
         served = f"{len(serving)} site(s)" if serving else "jev locally"
-        print(f"serving {served} with {settings.base_model}", flush=True)
+        lazy_suffix = " (lazy)" if lazy else ""
+        print(f"serving {served} with {settings.base_model}{lazy_suffix}", flush=True)
     if not settings.learn:
         print("learning off", flush=True)
     # The relay is byte-exact, so uvicorn must not put its own Date and Server headers next to
@@ -575,6 +582,7 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--config", metavar="PATH", help=_CONFIG_HELP)
     serve.add_argument("--upstream", metavar="URL", help="provider base URL to forward to")
     serve.add_argument("--port", type=int, metavar="N", help="port to listen on")
+    serve.add_argument("--lazy", action="store_true", help="load the base checkpoint on first use")
     serve.set_defaults(handler=_serve)
 
     status = commands.add_parser("status", help="summarise the captures recorded so far")
