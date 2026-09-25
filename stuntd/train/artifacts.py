@@ -48,6 +48,10 @@ class SiteModel:
     per_class: dict[str, ClassStats]
     confident_errors: list[ConfidentError]
     curve: list[Operating]
+    # None is the checkpoint's own length, which every head written by 0.1.0 was trained with.
+    max_len: int | None = None
+    head_max_len: int | None = None
+    spaced_labels: bool = False
 
 
 def site_dir(models: Path, site: str) -> Path:
@@ -96,6 +100,9 @@ def _from_dict(raw: dict[str, Any]) -> SiteModel:
         per_class={name: ClassStats(**stats) for name, stats in raw["per_class"].items()},
         confident_errors=[ConfidentError(**error) for error in raw["confident_errors"]],
         curve=[Operating(**point) for point in raw["curve"]],
+        max_len=raw.get("max_len"),
+        head_max_len=raw.get("head_max_len"),
+        spaced_labels=raw.get("spaced_labels", False),
     )
 
 

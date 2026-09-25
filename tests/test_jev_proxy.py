@@ -14,7 +14,9 @@ from stuntd.proxy.app import build_app
 from stuntd.serve.modes import MODE_LIVE, MODE_SHADOW, read_mode, write_mode
 from stuntd.settings import Settings, config_path, load_settings, models_path
 from stuntd.train.artifacts import SiteModel, load_model, save_model, site_dir
+from stuntd.train.layout import Layout
 from stuntd.train.metrics import ClassStats
+from stuntd.train.run import TrainedHead
 
 pytestmark = pytest.mark.anyio
 
@@ -463,7 +465,10 @@ class ToneProvider:
 def perfect_trainer_factory(settings):
     def trainer(dataset, head_path):
         head_path.write_bytes(b"head")
-        return [[3.0, 0.0] if item.label == 0 else [0.0, 3.0] for item in dataset.holdout]
+        return TrainedHead(
+            [[3.0, 0.0] if item.label == 0 else [0.0, 3.0] for item in dataset.holdout],
+            Layout(512, 192, spaced_labels=True),
+        )
 
     return trainer
 

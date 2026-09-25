@@ -30,7 +30,7 @@ def test_head_trains_on_a_local_checkpoint(tmp_path, trainer):
     from stuntd.train.artifacts import HEAD_FILE
 
     data = build_dataset("s", "boolean", BOOL, synthetic(), 10, 0.25)
-    logits = trainer(data, tmp_path / HEAD_FILE)
+    logits = trainer(data, tmp_path / HEAD_FILE).logits
     assert len(logits) == len(data.holdout) and all(len(row) == 2 for row in logits)
     with safe_open(str(tmp_path / HEAD_FILE), framework="pt") as handle:
         keys = list(handle.keys())
@@ -43,8 +43,8 @@ def test_head_resets_between_sites(tmp_path, trainer):
     from stuntd.train.artifacts import HEAD_FILE
 
     data = build_dataset("s", "boolean", BOOL, synthetic(), 10, 0.25)
-    first = trainer(data, tmp_path / HEAD_FILE)
-    second = trainer(data, tmp_path / HEAD_FILE)
+    first = trainer(data, tmp_path / HEAD_FILE).logits
+    second = trainer(data, tmp_path / HEAD_FILE).logits
     flat = [value for row in second for value in row]
     assert flat == pytest.approx([value for row in first for value in row], abs=1e-6)
 
@@ -68,7 +68,7 @@ def test_the_encoder_cache_agrees_with_the_uncached_path(tmp_path, laya_checkpoi
         trainer = LayaTrainer(
             laya_checkpoint, device="cpu", epochs=3, batch_size=8, cache_encoder=cached
         )
-        scores.append(agreement(trainer(data, head), data.holdout))
+        scores.append(agreement(trainer(data, head).logits, data.holdout))
         with safe_open(str(head), framework="pt") as handle:
             keys.append(set(handle.keys()))
     assert abs(scores[0] - scores[1]) <= 0.05

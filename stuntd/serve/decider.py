@@ -3,19 +3,19 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 import laya
 import torch
-from laya.common import QTYPES, build_sequence, collate_items
+from laya.common import collate_items
 from safetensors.torch import load_file
 
 from stuntd.train.artifacts import SiteModel
+from stuntd.train.layout import Layout
 from stuntd.train.metrics import confidence, softmax
-from stuntd.train.trainer import question_for
+from stuntd.train.trainer import site_row
 
 __all__ = ["HEAD_CACHE_SIZE", "Decider", "Verdict"]
 
@@ -85,7 +85,7 @@ class Decider:
             self._install(head_path)
             try:
                 started = time.perf_counter()
-                scores = self._scores(self._row(text, model.field, model.labels))
+                scores = self._scores(self._row(text, model))
                 latency_ms = round((time.perf_counter() - started) * 1000)
             except _TORCH_ERRORS as exc:
                 raise RuntimeError(f"decision failed: {exc}") from exc
@@ -115,7 +115,7 @@ class Decider:
         with self._lock:
             self._install(head_path)
             try:
-                self._scores(self._row(_WARM_TEXT, model.field, model.labels))
+                self._scores(self._row(_WARM_TEXT, model))
             except _TORCH_ERRORS as exc:
                 raise RuntimeError(f"warm-up failed: {exc}") from exc
 
@@ -189,15 +189,17 @@ class Decider:
             raise RuntimeError(f"decision failed: {exc}") from exc
         self._resident = _BASE_HEAD
 
-    def _row(self, text: str, field: str, labels: Sequence[str]) -> _Row:
+    def _row(self, text: str, model: SiteModel) -> _Row:
         cfg = self._agent.cfg
-        question = question_for(field, labels)
-        ids, markers = build_sequence(
-            self._agent.tok, text, question, cfg["max_len"], cfg["head_max_len"]
+        layout = Layout(
+            cfg["max_len"] if model.max_len is None else model.max_len,
+            cfg["head_max_len"] if model.head_max_len is None else model.head_max_len,
+            model.spaced_labels,
         )
-        if len(markers) < len(labels):
-            raise ValueError(f"{len(labels)} labels do not fit the head budget")
-        return {"ids": ids, "markers": markers, "qtype": QTYPES["choice"]}
+        row = site_row(self._agent.tok, text, model.field, model.labels, layout)
+        if len(row["markers"]) < len(model.labels):
+            raise ValueError(f"{len(model.labels)} labels do not fit the head budget")
+        return row
 
     def _scores(self, row: _Row) -> list[float]:
         # laya's collate_items types its return as optional, but a one-row batch never yields

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ctypes
 import logging
+import os
+import sys
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -14,14 +17,17 @@ from safetensors.torch import save_file
 from torch.nn.functional import cross_entropy
 
 from stuntd.train.dataset import Item, NotTrainable, SiteDataset
+from stuntd.train.layout import Layout, choose_layout, question_for
+from stuntd.train.run import TrainedHead
 
-__all__ = ["LayaTrainer", "question_for"]
+__all__ = ["LayaTrainer", "question_for", "site_row"]
 
 # The cache holds one fp16 row per token, so its cost is known from the tokenised rows before any
-# of it is built. 4 GiB leaves a 16 GB machine room for the model, the store and the rest of the
-# run, and covers around 30 000 examples of the length the demos capture.
-_CACHE_MAX_BYTES = 4 * 2**30
+# of it is built. This budget applies only where the machine does not say how much memory it has.
+_CACHE_FALLBACK_BYTES = 4 * 2**30
 _BYTES_PER_VALUE = 2
+
+_MAX_OPTION_TOKENS = 1024
 
 _ALLOCATION_FAILED = ("not enough memory", "out of memory")
 """What torch puts in a RuntimeError when an allocation fails instead of raising MemoryError."""
@@ -40,6 +46,21 @@ _Item = TypeVar("_Item")
 
 _log = logging.getLogger(__name__)
 
+if sys.platform == "win32":
+
+    class _MemoryStatus(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
 
 @dataclass(frozen=True)
 class _Encoded:
@@ -49,9 +70,11 @@ class _Encoded:
     label: int
 
 
-def question_for(field: str, labels: Sequence[str]) -> dict[str, Any]:
-    """The laya choice question for one site's field, asked the same way in training and serving."""
-    return {"t": "choice", "ins": f"Choose {field}", "crit": dict.fromkeys(labels)}
+def site_row(tok: Any, text: str, field: str, labels: Sequence[str], layout: Layout) -> _Row:
+    """One input for a site's head, built the same way in training and serving."""
+    question = question_for(field, labels, layout.spaced_labels)
+    ids, markers = build_sequence(tok, text, question, layout.max_len, layout.head_max_len)
+    return {"ids": ids, "markers": markers, "qtype": QTYPES["choice"]}
 
 
 def _chunks(items: Sequence[_Item], size: int) -> Iterator[list[_Item]]:
@@ -67,6 +90,27 @@ def _allocation_failed(exc: Exception) -> bool:
     return isinstance(exc, RuntimeError) and any(
         text in str(exc).lower() for text in _ALLOCATION_FAILED
     )
+
+
+def _physical_memory() -> int:
+    if sys.platform == "win32":
+        status = _MemoryStatus()
+        status.dwLength = ctypes.sizeof(status)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return 0
+        return int(status.ullTotalPhys)
+    try:
+        page_size, pages = os.sysconf("SC_PAGE_SIZE"), os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError):
+        return 0
+    # sysconf answers -1 rather than raising when a value is indeterminate.
+    return page_size * pages if page_size > 0 and pages > 0 else 0
+
+
+def _cache_budget(cache_max_bytes: int) -> int:
+    if cache_max_bytes:
+        return cache_max_bytes
+    return _physical_memory() // 2 or _CACHE_FALLBACK_BYTES
 
 
 def _cache_bytes(rows: Sequence[_Row], hidden_size: int) -> int:
@@ -120,7 +164,8 @@ class LayaTrainer:
         learning_rate: float = 1e-4,
         seed: int = 0,
         cache_encoder: bool = True,
-        cache_max_bytes: int = _CACHE_MAX_BYTES,
+        cache_max_bytes: int = 0,
+        max_option_tokens: int = _MAX_OPTION_TOKENS,
     ) -> None:
         self._base_model = base_model
         self._epochs = epochs
@@ -128,7 +173,8 @@ class LayaTrainer:
         self._learning_rate = learning_rate
         self._seed = seed
         self._cache_encoder = cache_encoder
-        self._cache_max_bytes = cache_max_bytes
+        self._cache_max_bytes = _cache_budget(cache_max_bytes)
+        self._max_option_tokens = max_option_tokens
         try:
             self._agent: Any = laya.Agent(base_model, device=None if device == "auto" else device)
         except _TORCH_ERRORS as exc:
@@ -146,33 +192,43 @@ class LayaTrainer:
     def __repr__(self) -> str:
         return f"LayaTrainer(base_model={self._base_model!r}, device={str(self._agent.device)!r})"
 
-    def __call__(self, dataset: SiteDataset, head_path: Path) -> list[list[float]]:
-        """Trains the head on one site, writes it to head_path and returns the holdout logits."""
+    def __call__(self, dataset: SiteDataset, head_path: Path) -> TrainedHead:
+        """Trains the head on one site, writes it to head_path and returns its logits and layout."""
         labels = len(dataset.labels)
         try:
             # One trainer fits every site, so each call starts from the checkpoint's own head
             # rather than from whatever the site before it left behind.
             self._agent.model.load_state_dict(self._pristine_head, strict=False)
-            train, holdout = self._items(dataset)
-            train_cache, holdout_cache = self._cache(train, holdout)
+            layout = self._layout(dataset)
+            train, holdout = self._items(dataset, layout)
+            train_cache, holdout_cache = self._cache(dataset.site, train, holdout)
             self._fit(train, train_cache, labels)
             logits = self._logits(holdout, holdout_cache, labels)
             _save_head(self._agent.model, head_path)
         except _TORCH_ERRORS as exc:
             raise RuntimeError(f"training failed: {exc}") from exc
-        return logits
+        return TrainedHead(logits, layout)
 
-    def _items(self, dataset: SiteDataset) -> tuple[list[_Row], list[_Row]]:
-        cfg = self._agent.cfg
-        question = question_for(dataset.field, dataset.labels)
+    def _layout(self, dataset: SiteDataset) -> Layout:
+        tok, cfg = self._agent.tok, self._agent.cfg
+        return choose_layout(
+            dataset.field,
+            dataset.labels,
+            lambda text: len(tok(text, add_special_tokens=False)["input_ids"]),
+            Layout(cfg["max_len"], cfg["head_max_len"], spaced_labels=False),
+            self._max_option_tokens,
+            self._agent.model.encoder.config.max_position_embeddings,
+        )
 
+    def _items(self, dataset: SiteDataset, layout: Layout) -> tuple[list[_Row], list[_Row]]:
         def row(item: Item) -> _Row:
-            ids, markers = build_sequence(
-                self._agent.tok, item.text, question, cfg["max_len"], cfg["head_max_len"]
-            )
-            if len(markers) < len(dataset.labels):
-                raise NotTrainable("labels do not fit the head budget")
-            return {"ids": ids, "markers": markers, "qtype": QTYPES["choice"], "label": item.label}
+            built = site_row(self._agent.tok, item.text, dataset.field, dataset.labels, layout)
+            if len(built["markers"]) < len(dataset.labels):
+                raise NotTrainable(
+                    f"{len(dataset.labels)} labels do not fit in {layout.head_max_len} tokens;"
+                    " raise training.max_option_tokens"
+                )
+            return {**built, "label": item.label}
 
         return [row(item) for item in dataset.train], [row(item) for item in dataset.holdout]
 
@@ -246,7 +302,7 @@ class LayaTrainer:
         return encoded
 
     def _cache(
-        self, train: list[_Row], holdout: list[_Row]
+        self, site: str, train: list[_Row], holdout: list[_Row]
     ) -> tuple[list[_Encoded] | None, list[_Encoded] | None]:
         if not self._cache_encoder:
             return None, None
@@ -254,8 +310,9 @@ class LayaTrainer:
         wanted = _cache_bytes(train, hidden_size) + _cache_bytes(holdout, hidden_size)
         if wanted > self._cache_max_bytes:
             _log.warning(
-                "re-encoding the encoder every epoch: its output needs %.1f GiB, over the %.1f "
-                "GiB this run caches at most",
+                "%s needs %.1f GiB for the encoder cache, over the %.1f GiB budget, so every epoch"
+                " re-encodes; raise training.cache_max_mb",
+                site,
                 wanted / 2**30,
                 self._cache_max_bytes / 2**30,
             )
@@ -265,7 +322,13 @@ class LayaTrainer:
         except (MemoryError, RuntimeError) as exc:
             if not _allocation_failed(exc):
                 raise
-            _log.warning("re-encoding the encoder every epoch: its output did not fit: %s", exc)
+            _log.warning(
+                "%s needs %.1f GiB for the encoder cache and memory ran out, so every epoch"
+                " re-encodes; free memory: %r",
+                site,
+                wanted / 2**30,
+                exc,
+            )
             return None, None
 
     def _autocast(self) -> AbstractContextManager[Any]:

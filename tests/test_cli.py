@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -12,6 +13,8 @@ from stuntd.cli import main
 from stuntd.store.db import Capture, Decision, Store
 from stuntd.store.redact import Redactor
 from stuntd.train.artifacts import HEAD_FILE
+from stuntd.train.layout import Layout
+from stuntd.train.run import TrainedHead
 
 
 def test_status_without_db(data_dir, capsys):
@@ -228,7 +231,20 @@ def seed_captures(data_dir, n=10, site="s1"):
 def fake_trainer_factory(settings):
     def trainer(dataset, head_path):
         head_path.write_bytes(b"h")
-        return [[2.0, 0.0] if item.label == 0 else [0.0, 2.0] for item in dataset.holdout]
+        return TrainedHead(
+            [[2.0, 0.0] if item.label == 0 else [0.0, 2.0] for item in dataset.holdout],
+            Layout(512, 192, spaced_labels=True),
+        )
+
+    return trainer
+
+
+def warning_trainer_factory(settings):
+    trained = fake_trainer_factory(settings)
+
+    def trainer(dataset, head_path):
+        logging.getLogger("stuntd.train.trainer").warning("%s: trains uncached", dataset.site)
+        return trained(dataset, head_path)
 
     return trainer
 
@@ -237,7 +253,8 @@ def barely_covering_trainer_factory(settings):
     def trainer(dataset, head_path):
         head_path.write_bytes(b"h")
         sure = [0.0, 10.0] if dataset.holdout[0].label else [10.0, 0.0]
-        return [sure] + [[0.001, 0.0] for _ in dataset.holdout[1:]]
+        logits = [sure] + [[0.001, 0.0] for _ in dataset.holdout[1:]]
+        return TrainedHead(logits, Layout(512, 192, spaced_labels=True))
 
     return trainer
 
@@ -265,7 +282,16 @@ def test_train_reports_each_site(data_dir, capsys, monkeypatch):
     assert (data_dir / "models" / "s1" / "meta.json").exists()
 
 
-def test_the_trainer_is_built_with_the_configured_encoder_cache(monkeypatch):
+def test_train_warnings_go_to_stderr(data_dir, capsys, monkeypatch):
+    seed_captures(data_dir)
+    write_training_config(data_dir)
+    monkeypatch.setattr("stuntd.cli._make_trainer", warning_trainer_factory)
+    assert main(["train"]) == 0
+    assert capsys.readouterr().err == "stuntd: s1: trains uncached\n"
+    assert logging.getLogger("stuntd").handlers == []
+
+
+def test_the_trainer_is_built_from_the_training_settings(monkeypatch):
     import types
 
     from stuntd.cli import _make_trainer
@@ -274,16 +300,26 @@ def test_the_trainer_is_built_with_the_configured_encoder_cache(monkeypatch):
     built = {}
 
     class FakeTrainer:
-        def __init__(self, base_model, device, epochs, cache_encoder, cache_max_bytes):
+        def __init__(
+            self, base_model, device, epochs, cache_encoder, cache_max_bytes, max_option_tokens
+        ):
             built.update(
-                epochs=epochs, cache_encoder=cache_encoder, cache_max_bytes=cache_max_bytes
+                epochs=epochs,
+                cache_encoder=cache_encoder,
+                cache_max_bytes=cache_max_bytes,
+                max_option_tokens=max_option_tokens,
             )
 
     module = types.ModuleType("stuntd.train.trainer")
     module.LayaTrainer = FakeTrainer
     monkeypatch.setitem(sys.modules, "stuntd.train.trainer", module)
-    _make_trainer(Settings(epochs=24, cache_encoder=False, cache_max_mb=512))
-    assert built == {"epochs": 24, "cache_encoder": False, "cache_max_bytes": 512 * 2**20}
+    _make_trainer(Settings(epochs=24, cache_encoder=False, cache_max_mb=512, max_option_tokens=640))
+    assert built == {
+        "epochs": 24,
+        "cache_encoder": False,
+        "cache_max_bytes": 512 * 2**20,
+        "max_option_tokens": 640,
+    }
 
 
 def test_train_without_torch_explains_the_extra(data_dir, capsys, monkeypatch):

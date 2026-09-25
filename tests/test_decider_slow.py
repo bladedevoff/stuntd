@@ -42,7 +42,7 @@ def opposite_head(source, target):
     save_file(head, str(target))
 
 
-def site_model(base_model, dataset, site=None):
+def site_model(base_model, dataset, layout, site=None):
     return SiteModel(
         site=site or dataset.site,
         kind=dataset.kind,
@@ -62,6 +62,9 @@ def site_model(base_model, dataset, site=None):
         per_class={},
         confident_errors=[],
         curve=[],
+        max_len=layout.max_len,
+        head_max_len=layout.head_max_len,
+        spaced_labels=layout.spaced_labels,
     )
 
 
@@ -82,16 +85,16 @@ def trained(laya_checkpoint, tmp_path_factory):
     for path in (head, other):
         path.parent.mkdir()
     dataset = build_dataset("refund", "boolean", BOOL, synthetic(), 10, 0.25)
-    logits = LayaTrainer(laya_checkpoint, device="cpu", epochs=1, batch_size=8)(dataset, head)
+    trained = LayaTrainer(laya_checkpoint, device="cpu", epochs=1, batch_size=8)(dataset, head)
     opposite_head(head, other)
     return SimpleNamespace(
         decider=Decider(laya_checkpoint, device="cpu"),
-        model=site_model(laya_checkpoint, dataset),
-        other_model=site_model(laya_checkpoint, dataset, "reversed"),
+        model=site_model(laya_checkpoint, dataset, trained.layout),
+        other_model=site_model(laya_checkpoint, dataset, trained.layout, "reversed"),
         head=head,
         other=other,
         dataset=dataset,
-        logits=logits,
+        logits=trained.logits,
     )
 
 

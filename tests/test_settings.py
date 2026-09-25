@@ -183,13 +183,32 @@ def test_encoder_cache_is_on_unless_the_file_turns_it_off(tmp_path):
 
 @pytest.mark.parametrize(
     ("line", "expected"),
-    [("", 4096), ("cache_max_mb = 512\n", 512), ("cache_max_mb = 0\n", 0)],
-    ids=["default", "custom", "zero-means-never-cached"],
+    [("", 0), ("cache_max_mb = 512\n", 512)],
+    ids=["default-half-of-memory", "custom"],
 )
 def test_cache_budget_comes_from_the_file(tmp_path, line, expected):
     cfg = tmp_path / "stuntd.toml"
     cfg.write_text(f"[training]\n{line}", encoding="utf-8")
     assert load_settings(cfg).cache_max_mb == expected
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [("", 1024), ("max_option_tokens = 640\n", 640)],
+    ids=["default", "custom"],
+)
+def test_option_budget_comes_from_the_file(tmp_path, line, expected):
+    cfg = tmp_path / "stuntd.toml"
+    cfg.write_text(f"[training]\n{line}", encoding="utf-8")
+    assert load_settings(cfg).max_option_tokens == expected
+
+
+@pytest.mark.parametrize("value", [0, -1], ids=["zero", "negative"])
+def test_an_option_budget_below_one_is_refused(tmp_path, value):
+    cfg = tmp_path / "stuntd.toml"
+    cfg.write_text(f"[training]\nmax_option_tokens = {value}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="max_option_tokens"):
+        load_settings(cfg)
 
 
 def test_a_negative_cache_budget_is_refused(tmp_path):
@@ -202,7 +221,9 @@ def test_a_negative_cache_budget_is_refused(tmp_path):
 def test_template_documents_training():
     assert "[training]" in CONFIG_TEMPLATE and "# target_agreement = 0.99" in CONFIG_TEMPLATE
     assert "# cache_encoder = true" in CONFIG_TEMPLATE
-    assert "# cache_max_mb = 4096" in CONFIG_TEMPLATE
+    assert "# cache_max_mb = 0" in CONFIG_TEMPLATE
+    assert "0 is half of physical memory" in CONFIG_TEMPLATE
+    assert "# max_option_tokens = 1024" in CONFIG_TEMPLATE
 
 
 def test_serving_section_is_read(tmp_path):

@@ -27,7 +27,7 @@ Three ways to run it:
 - **In front of the paid Jev API.** stuntd relays, learns from the provider's own answers, and
   takes the decision over once its head is right often enough.
 
-Status: first release, v0.1. Every number below traces to a demo in this repository or to a source
+Status: early release, v0.1. Every number below traces to a demo in this repository or to a source
 listed at the end.
 
 ## Who it is for
@@ -209,6 +209,9 @@ A **decision site** is one place in your code that makes one decision. On the Je
 the question's name. On the OpenAI path it is a hash of the response schema and the system prompt,
 or whatever you put in the `X-Stuntd-Site` request header.
 
+Keep one decision to a question. A question that mixes two, such as "is it urgent and which team
+handles it", learns worse than two separate questions.
+
 Each site walks through four modes.
 
 1. **collect.** The provider answers everything. stuntd stores the request text and the answer,
@@ -234,6 +237,35 @@ makes it a keyless local teacher: it answers, stuntd records, and the head learn
 
 Nothing is uploaded. Captures live in a SQLite file under your user directory with private
 permissions, and there is no telemetry.
+
+### Checking a head against verified rows
+
+Agreement measures how faithfully a head copies its teacher, the teacher's mistakes included. It
+says nothing about whether either of them is right. For that, write a few hundred rows a person
+has checked, in the same JSONL format `stuntd import` reads, and score the site against them:
+
+```
+stuntd report <site> --gold verified.jsonl
+```
+
+For example:
+
+```
+site tickets  gold rows 300: 296 used, 4 skipped
+head accuracy 0.892
+head accuracy 0.875 on 8 rows the store has not seen
+served accuracy 0.936 at threshold 0.62: 71% answered locally, 3 below it with no teacher answer
+teacher accuracy 0.948 on 288 rows
+head and teacher: both right 252, both wrong 10, head only 5, teacher only 21
+```
+
+The head answers every row. The teacher's answer is the latest capture of that exact text, so it
+is there only for rows stuntd has already seen, and those are rows the head may have trained on.
+The line for rows the store has not seen is the out-of-sample number, so do not import the gold
+rows or send them through the proxy before scoring. Served accuracy is what stuntd would serve
+once the site is live: the head at or above the threshold, the teacher below it. Rows whose answer
+is not one of the site's labels are skipped. `--json` prints the same numbers, and the command needs the train
+extra, since it loads the base model.
 
 ### The `X-Stuntd` header
 
@@ -298,7 +330,8 @@ from. Every key is optional and a missing one keeps the default.
 | `training.epochs` | `3` | Passes over the training rows. The demos use 24. |
 | `training.device` | `auto` | `auto`, `cpu`, `cuda` or `mps`. |
 | `training.cache_encoder` | `true` | Whether the frozen encoder runs once per example instead of once per epoch; off re-encodes. |
-| `training.cache_max_mb` | `4096` | Most memory the cached encoder output may take, in megabytes; a bigger site trains uncached. |
+| `training.cache_max_mb` | `0` | Most memory the cached encoder output may take, in megabytes; 0 is half of physical memory. A bigger site trains uncached and says so on stderr. |
+| `training.max_option_tokens` | `1024` | How far a site with many or long labels may widen the option budget, in tokens, so every label is shown whole; past it, labels are cut short. A value below the checkpoint's own budget (192) keeps the checkpoint's. |
 | `serving.check_share` | `0.02` | Share of live requests still sent to the provider to check the head. Inert in local Jev mode. |
 | `serving.window` | `100` | Recent decisions a site is judged on. |
 | `serving.min_window` | `20` | Decisions needed before that judgement counts. |
@@ -386,6 +419,12 @@ coverage 0.57. If your decision is really a calculation, write the calculation, 
   answers from it. The daemon runs one pass through the model before it accepts requests, so
   startup costs seconds and the first request then runs close to the steady-state p50. Lazy
   loading is on the roadmap.
+- **The first start needs the network.** `serve` and `train` load `training.base_model`, which
+  defaults to the Hub id, so the first run downloads the whole repository, the `multilingual/`
+  and `typed-decisions/` checkpoints included. With `HF_HUB_OFFLINE=1` the Hub id loads only
+  while that whole snapshot is in the Hugging Face cache; a partial one fails. For fully offline
+  use, set `training.base_model` to a local directory holding the checkpoint, such as the
+  snapshot folder.
 
 ## Compared with
 

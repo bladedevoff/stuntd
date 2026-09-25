@@ -13,6 +13,7 @@ from stuntd.settings import Settings, models_path
 from stuntd.store.db import SiteInfo, Store
 from stuntd.train.artifacts import HEAD_FILE, SiteModel, site_dir, write_meta
 from stuntd.train.dataset import NotTrainable, SiteDataset, build_dataset
+from stuntd.train.layout import Layout
 from stuntd.train.metrics import (
     confident_errors,
     ece,
@@ -23,7 +24,7 @@ from stuntd.train.metrics import (
     predict,
 )
 
-__all__ = ["NO_CAPTURES", "TrainResult", "Trainer", "train_sites"]
+__all__ = ["NO_CAPTURES", "TrainResult", "TrainedHead", "Trainer", "train_sites"]
 
 NO_CAPTURES = "no captures for this site"
 """Why a named site gets no model: nothing was ever recorded for it."""
@@ -33,8 +34,17 @@ _OLD_SUFFIX = ".old"
 
 _log = logging.getLogger(__name__)
 
-Trainer = Callable[[SiteDataset, Path], list[list[float]]]
-"""Fits a head on one dataset, writes it to the given path and returns the holdout logits."""
+
+@dataclass(frozen=True)
+class TrainedHead:
+    """What a trainer hands back for one site: the holdout logits and the layout it trained with."""
+
+    logits: list[list[float]]
+    layout: Layout
+
+
+Trainer = Callable[[SiteDataset, Path], TrainedHead]
+"""Fits a head on one dataset, writes it to the given path and says what it trained."""
 
 
 @dataclass(frozen=True)
@@ -93,11 +103,11 @@ def _publish(models: Path, site: str) -> None:
 
 
 def _evaluate(
-    dataset: SiteDataset, logits: Sequence[Sequence[float]], settings: Settings, trained_at: float
+    dataset: SiteDataset, trained: TrainedHead, settings: Settings, trained_at: float
 ) -> SiteModel:
     labels = [item.label for item in dataset.holdout]
-    temperature = fit_temperature(logits, labels)
-    predictions = predict(logits, labels, temperature)
+    temperature = fit_temperature(trained.logits, labels)
+    predictions = predict(trained.logits, labels, temperature)
     point = operating_point(predictions, settings.target_agreement)
     correct = sum(one.label == one.predicted for one in predictions)
     return SiteModel(
@@ -119,6 +129,9 @@ def _evaluate(
         per_class=per_class(predictions, dataset.labels),
         confident_errors=confident_errors(predictions, [item.text for item in dataset.holdout]),
         curve=operating_curve(predictions),
+        max_len=trained.layout.max_len,
+        head_max_len=trained.layout.head_max_len,
+        spaced_labels=trained.layout.spaced_labels,
     )
 
 
@@ -144,8 +157,7 @@ def _train_one(
     working = site_dir(_work_root(models), info.site)
     try:
         _fresh(working)
-        logits = trainer(dataset, working / HEAD_FILE)
-        model = _evaluate(dataset, logits, settings, now())
+        model = _evaluate(dataset, trainer(dataset, working / HEAD_FILE), settings, now())
         write_meta(working, model)
         write_mode(working, MODE_SHADOW, model.trained_at)
         _publish(models, info.site)

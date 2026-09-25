@@ -10,7 +10,9 @@ from stuntd.serve.monitor import Window, window_agreement
 from stuntd.settings import config_path, load_settings, models_path
 from stuntd.store.db import Decision
 from stuntd.train.artifacts import SiteModel, load_model, save_model, site_dir
+from stuntd.train.layout import Layout
 from stuntd.train.metrics import ClassStats, confidence, operating_point, predict, softmax
+from stuntd.train.run import TrainedHead
 
 pytestmark = pytest.mark.anyio
 
@@ -53,7 +55,10 @@ def write_config(data_dir, check_share=0.0, min_window=5):
 def perfect_trainer_factory(settings):
     def trainer(dataset, head_path):
         head_path.write_bytes(b"head")
-        return [[3.0, 0.0] if item.label == 0 else [0.0, 3.0] for item in dataset.holdout]
+        return TrainedHead(
+            [[3.0, 0.0] if item.label == 0 else [0.0, 3.0] for item in dataset.holdout],
+            Layout(512, 192, spaced_labels=True),
+        )
 
     return trainer
 

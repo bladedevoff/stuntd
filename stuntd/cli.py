@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import sqlite3
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -32,12 +34,14 @@ from stuntd.settings import (
     models_path,
 )
 from stuntd.train.artifacts import HEAD_FILE, SiteModel, list_models, load_model, site_dir
+from stuntd.train.gold import GoldRow, render_gold, render_gold_json, score_gold
 from stuntd.train.report import render, render_json
 from stuntd.train.run import NO_CAPTURES, Trainer, TrainResult, train_sites
 
 if TYPE_CHECKING:
     from stuntd.serve.runtime import DeciderLike
     from stuntd.store.db import Capture, Store
+    from stuntd.store.redact import Redactor
 
 __all__ = ["main"]
 
@@ -260,6 +264,7 @@ def _make_trainer(settings: Settings) -> Trainer:
         settings.epochs,
         cache_encoder=settings.cache_encoder,
         cache_max_bytes=settings.cache_max_mb * 2**20,
+        max_option_tokens=settings.max_option_tokens,
     )
 
 
@@ -290,6 +295,19 @@ def _result_line(result: TrainResult) -> str:
     )
 
 
+@contextmanager
+def _warnings_on_stderr() -> Iterator[None]:
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.WARNING)
+    handler.setFormatter(logging.Formatter("stuntd: %(message)s"))
+    logger = logging.getLogger("stuntd")
+    logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
+
+
 def _train(args: argparse.Namespace) -> int:
     from stuntd.store.db import Store
     from stuntd.store.redact import Redactor
@@ -314,7 +332,8 @@ def _train(args: argparse.Namespace) -> int:
             # Building the trainer fetches the checkpoint, which is a long silent wait without
             # the line, so it waits until a site actually needs training.
             print(_base_model_line(settings), flush=True)
-            results = train_sites(store, settings, _load_trainer(settings), sites)
+            with _warnings_on_stderr():
+                results = train_sites(store, settings, _load_trainer(settings), sites)
     finally:
         store.close()
     for result in results:
@@ -323,7 +342,7 @@ def _train(args: argparse.Namespace) -> int:
 
 
 class _InvalidLine(Exception):
-    """A row of an import file that cannot be recorded, already named by its line number."""
+    """A row of a labelled JSONL file that cannot be used, already named by its line number."""
 
 
 def _decision_schema(schema: object) -> DecisionSchema:
@@ -386,7 +405,7 @@ def _check_answer(schema: DecisionSchema, answer: str) -> None:
             raise ValueError(f"answer {answer!r} is not a finite number")
 
 
-def _labelled_row(line: str, schema: DecisionSchema) -> tuple[str, str]:
+def _labelled_row(line: str, schema: DecisionSchema | None) -> tuple[str, str]:
     try:
         row = json.loads(line)
     except json.JSONDecodeError as exc:
@@ -398,26 +417,31 @@ def _labelled_row(line: str, schema: DecisionSchema) -> tuple[str, str]:
         raise ValueError("text must be a non-empty string")
     if not isinstance(answer, str):
         raise ValueError("answer must be a string")
-    _check_answer(schema, answer)
+    if schema is not None:
+        _check_answer(schema, answer)
     return text, answer
 
 
-def _import_captures(path: Path, site: str, schema: DecisionSchema) -> list[Capture]:
-    from stuntd.store.db import Capture
-
-    captures = []
+def _labelled_rows(path: Path, schema: DecisionSchema | None = None) -> list[tuple[str, str]]:
+    rows = []
     # utf-8-sig so a file written by a Windows editor is not read with its BOM glued to line 1.
     for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1):
         if not line.strip():
             continue
         try:
-            text, answer = _labelled_row(line, schema)
+            rows.append(_labelled_row(line, schema))
         except ValueError as exc:
             raise _InvalidLine(f"line {number}: {exc}") from exc
-        captures.append(
-            Capture(site, schema.canonical, schema.kind, text, answer, _IMPORT_MODEL, 0, None, None)
-        )
-    return captures
+    return rows
+
+
+def _import_captures(path: Path, site: str, schema: DecisionSchema) -> list[Capture]:
+    from stuntd.store.db import Capture
+
+    return [
+        Capture(site, schema.canonical, schema.kind, text, answer, _IMPORT_MODEL, 0, None, None)
+        for text, answer in _labelled_rows(path, schema)
+    ]
 
 
 def _import(args: argparse.Namespace) -> int:
@@ -470,6 +494,12 @@ def _report(args: argparse.Namespace) -> int:
     _require_learning(args.config, settings)
     models = models_path(settings)
     site = None if args.site is None else _site_name(args.site)
+    if args.gold is not None:
+        if site is None:
+            raise ValueError("report --gold needs the SITE to score")
+        if args.curve:
+            raise ValueError("--curve and --gold do not combine")
+        return _gold_report(settings, site, Path(args.gold), args.json)
     found = list_models(models) if site is None else [_one_model(models, site)]
     if args.json:
         print(render_json(found))
@@ -478,6 +508,59 @@ def _report(args: argparse.Namespace) -> int:
         print("no trained sites yet")
         return 0
     print("\n\n".join(render(model, args.curve) for model in found))
+    return 0
+
+
+def _teacher_answers(settings: Settings, site: str, redactor: Redactor) -> dict[str, str]:
+    from stuntd.store.db import Store
+
+    database = database_path(settings)
+    if not database.exists():
+        return {}
+    store = Store(database, redactor)
+    try:
+        # Examples come oldest first, so the latest capture of a text is the one left standing.
+        return {example.input_text: example.answer for example in store.examples(site)}
+    finally:
+        store.close()
+
+
+def _gold_rows(
+    settings: Settings, model: SiteModel, usable: list[tuple[str, str]]
+) -> list[GoldRow]:
+    from stuntd.store.redact import Redactor
+
+    try:
+        decider = _make_decider(settings)
+    except ImportError as exc:
+        raise ValueError(
+            'report --gold needs the train extra: pip install "stuntd[train]"'
+        ) from exc
+    # Captures are stored redacted, so a gold text is matched and asked in its redacted form.
+    redactor = Redactor(settings.redaction_patterns, builtin=settings.redact)
+    teacher = _teacher_answers(settings, model.site, redactor)
+    head_path = site_dir(models_path(settings), model.site) / HEAD_FILE
+    rows = []
+    for text, answer in usable:
+        redacted = redactor.apply(text)
+        verdict = decider.decide(model, head_path, redacted)
+        rows.append(
+            GoldRow(answer, model.labels[verdict.label], verdict.confidence, teacher.get(redacted))
+        )
+    return rows
+
+
+def _gold_report(settings: Settings, site: str, path: Path, as_json: bool) -> int:
+    model = _one_model(models_path(settings), site)
+    try:
+        gold = _labelled_rows(path)
+    except _InvalidLine as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    usable = [(text, answer) for text, answer in gold if answer in model.labels]
+    rows = _gold_rows(settings, model, usable) if usable else []
+    score = score_gold(rows, model.threshold, len(gold) - len(usable))
+    print(render_gold_json(model, score) if as_json else render_gold(model, score))
     return 0
 
 
@@ -595,7 +678,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     report.add_argument("--config", metavar="PATH", help=_CONFIG_HELP)
     report.add_argument("--json", action="store_true", help="print the models as JSON")
-    report.add_argument("--curve", action="store_true", help="add the whole threshold curve")
+    report.add_argument(
+        "--curve", action="store_true", help="add the threshold curve at every 5%% of coverage"
+    )
+    report.add_argument(
+        "--gold",
+        metavar="FILE",
+        help='score the head and its teacher against a JSONL file of verified {"text": ...,'
+        ' "answer": ...} rows; needs the train extra',
+    )
     report.set_defaults(handler=_report)
 
     enable = commands.add_parser("enable", help="let a trained site answer from its own model")

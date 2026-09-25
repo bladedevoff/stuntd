@@ -5,6 +5,8 @@ import pytest
 
 from stuntd.cli import main
 from stuntd.decisions.schema import detect_schema
+from stuntd.train.layout import Layout
+from stuntd.train.run import TrainedHead
 
 SPAM_SCHEMA = {"type": "object", "properties": {"spam": {"type": "boolean"}}}
 
@@ -44,7 +46,10 @@ def stored(data_dir):
 def fake_trainer_factory(settings):
     def trainer(dataset, head_path):
         head_path.write_bytes(b"h")
-        return [[2.0, 0.0] if item.label == 0 else [0.0, 2.0] for item in dataset.holdout]
+        return TrainedHead(
+            [[2.0, 0.0] if item.label == 0 else [0.0, 2.0] for item in dataset.holdout],
+            Layout(512, 192, spaced_labels=True),
+        )
 
     return trainer
 

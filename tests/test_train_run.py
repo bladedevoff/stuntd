@@ -8,9 +8,11 @@ from stuntd.store.db import Capture, Store
 from stuntd.store.redact import Redactor
 from stuntd.train.artifacts import HEAD_FILE, META_FILE, load_model
 from stuntd.train.dataset import NotTrainable
-from stuntd.train.run import train_sites
+from stuntd.train.layout import Layout
+from stuntd.train.run import TrainedHead, train_sites
 
 SCHEMA = '{"properties":{"spam":{"type":"boolean"}},"type":"object"}'
+LAYOUT = Layout(max_len=700, head_max_len=380, spaced_labels=True)
 
 
 def capture(site, text, answer):
@@ -34,7 +36,8 @@ def settings():
 
 def perfect_trainer(dataset, head_path):
     head_path.write_bytes(b"head")
-    return [[3.0, 0.0] if item.label == 0 else [0.0, 3.0] for item in dataset.holdout]
+    logits = [[3.0, 0.0] if item.label == 0 else [0.0, 3.0] for item in dataset.holdout]
+    return TrainedHead(logits, LAYOUT)
 
 
 def failing_trainer(dataset, head_path):
@@ -56,6 +59,14 @@ def test_trained_site_gets_a_model_and_the_thin_one_a_reason(store, data_dir):
     assert (
         results["thin"].model is None and "examples after deduplication" in results["thin"].reason
     )
+
+
+def test_the_trainer_layout_is_written_into_the_metadata(store):
+    train_sites(store, settings(), perfect_trainer, sites=["s1"])
+    raw = json.loads((models_path(settings()) / "s1" / META_FILE).read_text(encoding="utf-8"))
+    assert (raw["max_len"], raw["head_max_len"], raw["spaced_labels"]) == (700, 380, True)
+    model = load_model(models_path(settings()), "s1")
+    assert (model.max_len, model.head_max_len, model.spaced_labels) == (700, 380, True)
 
 
 def test_only_named_sites_are_trained(store):

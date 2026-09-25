@@ -52,6 +52,24 @@ def test_round_trip(tmp_path):
     assert load_model(tmp_path / "models", "s1") == model()
 
 
+def test_round_trip_keeps_the_layout(tmp_path):
+    widened = replace(model(), max_len=960, head_max_len=640, spaced_labels=True)
+    save_model(tmp_path / "models", widened)
+    assert load_model(tmp_path / "models", "s1") == widened
+
+
+def test_metadata_without_a_layout_loads_as_the_checkpoint_one(tmp_path):
+    raw = asdict(model())
+    for key in ("max_len", "head_max_len", "spaced_labels"):
+        del raw[key]
+    folder = tmp_path / "models" / "s1"
+    folder.mkdir(parents=True)
+    (folder / META_FILE).write_text(json.dumps(raw), encoding="utf-8")
+    loaded = load_model(tmp_path / "models", "s1")
+    assert (loaded.max_len, loaded.head_max_len, loaded.spaced_labels) == (None, None, False)
+    assert loaded == model()
+
+
 def test_list_models_is_sorted_and_tolerates_missing_dir(tmp_path):
     assert list_models(tmp_path / "none") == []
     save_model(tmp_path / "models", model("b"))

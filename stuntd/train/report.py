@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import time
+from bisect import bisect_left
 from collections.abc import Sequence
 from dataclasses import asdict
 
 from stuntd.train.artifacts import SiteModel
 from stuntd.train.metrics import ConfidentError, Operating
 
-__all__ = ["TIME_FORMAT", "render", "render_json"]
+__all__ = ["TIME_FORMAT", "render", "render_json", "thin_curve"]
 
 TIME_FORMAT = "%Y-%m-%d %H:%M"
 """How stuntd prints a recorded moment, in local time."""
@@ -16,6 +17,7 @@ TIME_FORMAT = "%Y-%m-%d %H:%M"
 _CLASS_WIDTH = 18
 _SUPPORT_WIDTH = 8
 _CURVE_HEADER = "threshold  coverage  agreement"
+_CURVE_STEPS = 20
 
 
 def _class_row(name: object, support: object, agreement: object) -> str:
@@ -60,6 +62,16 @@ def _curve_row(point: Operating) -> str:
     return f"{point.threshold:>9.2f}  {point.coverage:>8.2f}  {point.agreement:>9.3f}"
 
 
+def thin_curve(curve: Sequence[Operating], threshold: float | None) -> list[Operating]:
+    """The curve at every 5% of coverage plus the operating point, in the curve's own order."""
+    coverages = [point.coverage for point in curve]
+    # The first point at or past each step is the strictest threshold that answers that much.
+    kept = {bisect_left(coverages, step / _CURVE_STEPS) for step in range(1, _CURVE_STEPS + 1)}
+    return [
+        point for index, point in enumerate(curve) if index in kept or point.threshold == threshold
+    ]
+
+
 def render(model: SiteModel, curve: bool = False) -> str:
     """One trained site as the block of text the report command prints."""
     lines = [*_headline(model), "", *_table(model)]
@@ -70,7 +82,7 @@ def render(model: SiteModel, curve: bool = False) -> str:
     if curve:
         lines.append("")
         lines.append(_CURVE_HEADER)
-        lines.extend(_curve_row(point) for point in model.curve)
+        lines.extend(_curve_row(point) for point in thin_curve(model.curve, model.threshold))
     return "\n".join(lines)
 
 

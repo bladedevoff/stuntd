@@ -60,8 +60,12 @@ CONFIG_TEMPLATE = """# stuntd settings. Every key is optional; a missing key kee
 # device = "auto"                # auto, cpu, cuda or mps
 # Whether the frozen encoder runs once per example instead of once per epoch; off re-encodes.
 # cache_encoder = true
-# Most memory the cached encoder output may take, in megabytes; a bigger site trains uncached.
-# cache_max_mb = 4096
+# Most memory the cached encoder output may take, in megabytes; 0 is half of physical memory.
+# A site that needs more trains uncached, re-encoding every epoch.
+# cache_max_mb = 0
+# How far the option budget may widen, in tokens, so a site's labels fit whole; past it, labels
+# are cut short. Below the checkpoint's own budget (192) it has no effect.
+# max_option_tokens = 1024
 
 [serving]
 # Share of the requests a serving site still sends to the provider to check its own answer.
@@ -108,6 +112,7 @@ _SECTIONS = {
         "device": str,
         "cache_encoder": bool,
         "cache_max_mb": int,
+        "max_option_tokens": int,
     },
     "serving": {
         "check_share": float,
@@ -175,8 +180,11 @@ class Settings:
     cache_encoder: bool = True
     """Whether the frozen encoder runs once per example rather than once per epoch."""
 
-    cache_max_mb: int = 4096
-    """Most memory the cached encoder output may take; a site that needs more trains uncached."""
+    cache_max_mb: int = 0
+    """Most megabytes the cached encoder output may take; 0 is half of physical memory."""
+
+    max_option_tokens: int = 1024
+    """Most tokens the option budget may widen to; below the checkpoint's own it has no effect."""
 
     check_share: float = 0.02
     """Share of the requests a serving site still sends to the provider to check its own answer,
@@ -311,6 +319,9 @@ def load_settings(path: Path | None = None, overrides: dict[str, Any] | None = N
     settings.device = values.get("training.device", settings.device)
     settings.cache_encoder = values.get("training.cache_encoder", settings.cache_encoder)
     settings.cache_max_mb = values.get("training.cache_max_mb", settings.cache_max_mb)
+    settings.max_option_tokens = values.get(
+        "training.max_option_tokens", settings.max_option_tokens
+    )
     settings.check_share = values.get("serving.check_share", settings.check_share)
     settings.window = values.get("serving.window", settings.window)
     settings.min_window = values.get("serving.min_window", settings.min_window)
@@ -348,6 +359,10 @@ def load_settings(path: Path | None = None, overrides: dict[str, Any] | None = N
         raise ValueError(f"epochs must be at least 1, got {settings.epochs!r}")
     if settings.cache_max_mb < 0:
         raise ValueError(f"cache_max_mb cannot be negative, got {settings.cache_max_mb!r}")
+    if settings.max_option_tokens < 1:
+        raise ValueError(
+            f"max_option_tokens must be at least 1, got {settings.max_option_tokens!r}"
+        )
     if settings.device not in _DEVICES:
         raise ValueError(f"device must be one of {', '.join(_DEVICES)}, got {settings.device!r}")
     if not 0 <= settings.check_share < 1:
