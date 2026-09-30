@@ -57,31 +57,25 @@ class Verdict:
 class Decider:
     """Runs the Laya encoder once and swaps in the trained head of whichever site asks."""
 
-    def __init__(self, base_model: str, device: str = "auto") -> None:
+    def __init__(self, base_model: str, device: str = "auto", lazy: bool = False) -> None:
         self._base_model = base_model
-        try:
-            self._agent: Any = laya.Agent(base_model, device=None if device == "auto" else device)
-            self._agent.model.eval()
-            self._dtype: torch.dtype = next(self._agent.model.parameters()).dtype
-            self._base_head: dict[str, torch.Tensor] = {
-                name: tensor.detach().clone()
-                for name, tensor in self._agent.model.state_dict().items()
-                if name.startswith(_HEAD_PREFIXES)
-            }
-        except _TORCH_ERRORS as exc:
-            raise RuntimeError(f"base model failed to load: {exc}") from exc
+        self._device = device
+        self._agent: Any = None
         self._heads: OrderedDict[_HeadKey, dict[str, torch.Tensor]] = OrderedDict()
         self._resident: _HeadKey | Literal["base"] | None = None
         self._lock = threading.Lock()
+        if not lazy:
+            self._load()
 
     def __repr__(self) -> str:
-        return f"Decider(base_model={self._base_model!r}, device={str(self._agent.device)!r})"
+        return f"Decider(base_model={self._base_model!r}, device={self._device!r})"
 
     def decide(self, model: SiteModel, head_path: Path, text: str) -> Verdict:
         """Answers one request with the site's own head."""
         # One model carries one site's head at a time, so a caller's thread pool would otherwise
         # have two sites reading each other's weights mid-pass.
         with self._lock:
+            self._ensure_loaded()
             self._install(head_path)
             try:
                 started = time.perf_counter()
@@ -99,6 +93,7 @@ class Decider:
         The reply drops laya's per-answer action estimate, which is not part of a Jev answer.
         """
         with self._lock:
+            self._ensure_loaded()
             self._install_base()
             try:
                 result = self._agent.system_one(state, questions)
@@ -113,6 +108,7 @@ class Decider:
     def warm(self, model: SiteModel, head_path: Path) -> None:
         """Installs one site's head and runs a pass through it, so no caller waits for the first."""
         with self._lock:
+            self._ensure_loaded()
             self._install(head_path)
             try:
                 self._scores(self._row(_WARM_TEXT, model))
@@ -122,6 +118,26 @@ class Decider:
     def warm_base(self) -> None:
         """Runs one zero-shot pass, so the first Jev caller of a fresh daemon does not pay for it."""
         self.answer(_WARM_TEXT, {"warm": {"type": "noul", "instructions": "", "criteria": None}})
+
+    def _ensure_loaded(self) -> None:
+        if self._agent is None:
+            self._load()
+
+    def _load(self) -> None:
+        try:
+            agent: Any = laya.Agent(
+                self._base_model, device=None if self._device == "auto" else self._device
+            )
+            agent.model.eval()
+            self._dtype: torch.dtype = next(agent.model.parameters()).dtype
+            self._base_head: dict[str, torch.Tensor] = {
+                name: tensor.detach().clone()
+                for name, tensor in agent.model.state_dict().items()
+                if name.startswith(_HEAD_PREFIXES)
+            }
+        except _TORCH_ERRORS as exc:
+            raise RuntimeError(f"base model failed to load: {exc}") from exc
+        self._agent = agent
 
     def _head(self, head_path: Path, key: _HeadKey) -> dict[str, torch.Tensor]:
         cached = self._heads.get(key)

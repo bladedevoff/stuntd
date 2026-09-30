@@ -6,8 +6,8 @@ import sqlite3
 import stat
 import time
 from collections import OrderedDict
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
@@ -211,6 +211,19 @@ class Runtime:
         return Outcome(
             MODE_LIVE, None, answer, verdict.confidence, verdict.latency_ms, verdict.probabilities
         )
+
+    async def live_fields(self, states: Sequence[SiteState], text: str, site: str) -> list[Outcome]:
+        """Answers each live field of one request from its own model, stopping at the first that
+        cannot; the check sample is drawn once for the request, so it compares every field."""
+        outcomes: list[Outcome] = []
+        for state in states:
+            outcome = await self.live(state, text, check=False)
+            outcomes.append(outcome)
+            if outcome.mode != MODE_LIVE:
+                return outcomes
+        if not should_check(input_hash(site, text), self._settings.check_share):
+            return outcomes
+        return [replace(outcome, mode=MODE_COLLECT, reason=MODE_CHECK) for outcome in outcomes]
 
     def compare(self, state: SiteState, outcome: Outcome, big_answer: str) -> None:
         """Records how a sampled check turned out and demotes the site when it keeps losing."""

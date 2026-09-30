@@ -176,6 +176,7 @@ async def test_cycle_collects_trains_shadows_serves_and_demotes(data_dir, monkey
                 "shadow": 6,
                 "live": 1,
                 "agreement": 0.0,
+                "retrain": None,
             }
         ],
     }

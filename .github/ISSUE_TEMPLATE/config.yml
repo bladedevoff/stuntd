@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question
+    url: https://github.com/bladedevoff/stuntd/discussions/categories/q-a
+    about: Ask about setup, training or the numbers in Discussions.
+  - name: Show and tell
+    url: https://github.com/bladedevoff/stuntd/discussions/categories/show-and-tell
+    about: Share what you run through stuntd.

@@ -67,6 +67,8 @@ _EXAMPLES = (
     "select input_text, answer, created_at from captures where site = ? order by created_at, id"
 )
 
+_CAPTURES_SINCE = "select count(*) from captures where site = ? and created_at > ?"
+
 _SITES = (
     "select latest.site, captures.kind, captures.schema_canonical, latest.total from"
     " (select site, count(*) as total, max(id) as last_id from captures group by site) as latest"
@@ -225,6 +227,9 @@ class Store:
     def examples(self, site: str) -> list[Example]:
         rows = self._conn.execute(_EXAMPLES, (site,)).fetchall()
         return [Example(text, answer, created_at) for text, answer, created_at in rows]
+
+    def captures_since(self, site: str, since: float) -> int:
+        return int(self._conn.execute(_CAPTURES_SINCE, (site, since)).fetchone()[0])
 
     def decisions(self, site: str, limit: int) -> list[Decision]:
         _check_limit(limit)

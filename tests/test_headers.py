@@ -74,3 +74,7 @@ def test_jev_header_rejects_a_value_outside_its_charset(field):
     mode = field.pop("mode", "local")
     with pytest.raises(ValueError):
         jev_header(mode, **field)
+
+
+def test_stuntd_header_accepts_a_field_in_the_reason():
+    assert stuntd_header("collect", reason="not-live:urgent") == "collect; reason=not-live:urgent"

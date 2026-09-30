@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from stuntd.decisions.schema import DecisionSchema
+from stuntd.decisions.schema import DecisionSchema, MultiFieldSchema
 from stuntd.serve.answer import completion_body, label_value
 
 CHOICE = DecisionSchema("choice", "verdict", ("allow", "block"), "response_format", None, "{}")
@@ -29,7 +29,7 @@ def test_label_value_is_typed(kind, label, expected):
 
 def test_response_format_completion_shape():
     body = json.loads(
-        completion_body(CHOICE, "block", "gpt-x", 1_700_000_000, "chatcmpl-stuntd-abc")
+        completion_body(CHOICE, ("block",), "gpt-x", 1_700_000_000, "chatcmpl-stuntd-abc")
     )
     assert (
         body["object"] == "chat.completion"
@@ -44,7 +44,7 @@ def test_response_format_completion_shape():
 
 
 def test_tool_completion_shape():
-    body = json.loads(completion_body(TOOL, "3", "gpt-x", 1, "chatcmpl-stuntd-abc"))
+    body = json.loads(completion_body(TOOL, ("3",), "gpt-x", 1, "chatcmpl-stuntd-abc"))
     choice = body["choices"][0]
     call = choice["message"]["tool_calls"][0]
     assert choice["finish_reason"] == "tool_calls" and choice["message"]["content"] is None
@@ -55,7 +55,7 @@ def test_tool_completion_shape():
 
 
 def test_body_is_compact_utf8():
-    raw = completion_body(CHOICE, "block", "модель", 1, "x")
+    raw = completion_body(CHOICE, ("block",), "модель", 1, "x")
     assert b": " not in raw and "модель".encode() in raw
 
 
@@ -83,4 +83,10 @@ def test_label_value_non_finite_number_raises(label):
 def test_completion_body_unknown_source_raises():
     unknown = DecisionSchema("choice", "verdict", ("allow", "block"), "mystery", None, "{}")
     with pytest.raises(ValueError, match="'mystery'"):
-        completion_body(unknown, "block", "gpt-x", 1, "x")
+        completion_body(unknown, ("block",), "gpt-x", 1, "x")
+
+
+def test_multi_field_completion_carries_every_field_in_order():
+    schema = MultiFieldSchema((CHOICE, TOOL), "{}")
+    body = json.loads(completion_body(schema, ("block", "3"), "gpt-x", 1, "x"))
+    assert body["choices"][0]["message"]["content"] == '{"verdict":"block","priority":3}'

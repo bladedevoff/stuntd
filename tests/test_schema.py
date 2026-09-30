@@ -1,6 +1,6 @@
 import pytest
 
-from stuntd.decisions.schema import detect_schema
+from stuntd.decisions.schema import MAX_FIELDS, DecisionSchema, MultiFieldSchema, detect_schema
 
 
 def chat(**extra):
@@ -82,19 +82,7 @@ def test_tool_with_single_enum_parameter():
     assert schema.source == "tool" and schema.tool_name == "route" and schema.kind == "choice"
 
 
-def test_multi_field_and_free_text_are_not_decisions():
-    two_fields = chat(
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "x",
-                "schema": {
-                    "type": "object",
-                    "properties": {"a": {"type": "boolean"}, "b": {"type": "boolean"}},
-                },
-            },
-        }
-    )
+def test_free_text_is_not_a_decision():
     free = chat(
         response_format={
             "type": "json_schema",
@@ -107,7 +95,6 @@ def test_multi_field_and_free_text_are_not_decisions():
             },
         }
     )
-    assert detect_schema(two_fields) is None
     assert detect_schema(free) is None
     assert detect_schema(chat()) is None
     assert detect_schema(chat(response_format={"type": "json_object"})) is None
@@ -238,3 +225,100 @@ def test_canonical_ignores_key_order():
 )
 def test_malformed_payloads_are_not_decisions(request_body):
     assert detect_schema(request_body) is None
+
+
+def typed_properties(count):
+    return {f"f{i}": {"type": "boolean"} for i in range(count)}
+
+
+def form(properties, **extra):
+    return chat(
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "x",
+                "schema": {"type": "object", "properties": properties, **extra},
+            },
+        }
+    )
+
+
+def test_two_typed_fields_are_a_multi_field_decision():
+    schema = detect_schema(
+        form(
+            {
+                "category": {"type": "string", "enum": ["billing", "tech"]},
+                "urgent": {"type": "boolean"},
+                "score": {"type": "integer"},
+            }
+        )
+    )
+    assert isinstance(schema, MultiFieldSchema)
+    assert [(f.field, f.kind, f.options) for f in schema.fields] == [
+        ("category", "choice", ("billing", "tech")),
+        ("urgent", "boolean", ()),
+        ("score", "number", ()),
+    ]
+    assert {f.source for f in schema.fields} == {"response_format"}
+
+
+def test_max_fields_are_a_decision():
+    schema = detect_schema(form(typed_properties(MAX_FIELDS)))
+    assert isinstance(schema, MultiFieldSchema)
+    assert len(schema.fields) == MAX_FIELDS
+
+
+def test_more_than_max_fields_is_free_text():
+    assert detect_schema(form(typed_properties(MAX_FIELDS + 1))) is None
+
+
+@pytest.mark.parametrize(
+    "untyped",
+    [
+        {"type": "string"},
+        {"type": "array", "items": {"type": "string"}},
+        {"type": "object", "properties": {"a": {"type": "boolean"}}},
+        {"type": "string", "enum": []},
+    ],
+    ids=["text", "array", "nested", "empty-enum"],
+)
+def test_a_field_that_is_not_typed_makes_the_request_free_text(untyped):
+    assert detect_schema(form({"a": {"type": "boolean"}, "b": untyped})) is None
+
+
+def test_optional_field_is_still_a_field():
+    schema = detect_schema(
+        form({"a": {"type": "boolean"}, "b": {"type": "boolean"}}, required=["a"])
+    )
+    assert isinstance(schema, MultiFieldSchema)
+    assert len(schema.fields) == 2
+
+
+def test_multi_field_tool_carries_the_tool_name_on_every_field():
+    schema = detect_schema(
+        chat(
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "triage",
+                        "parameters": {"type": "object", "properties": typed_properties(2)},
+                    },
+                }
+            ]
+        )
+    )
+    assert isinstance(schema, MultiFieldSchema)
+    assert {(f.source, f.tool_name) for f in schema.fields} == {("tool", "triage")}
+
+
+def test_field_canonical_is_a_single_field_schema():
+    schema = detect_schema(form({"a": {"type": "boolean"}, "b": {"type": "integer"}}))
+    assert [f.canonical for f in schema.fields] == [
+        '{"properties":{"a":{"type":"boolean"}},"type":"object"}',
+        '{"properties":{"b":{"type":"integer"}},"type":"object"}',
+    ]
+
+
+def test_single_field_stays_a_decision_schema():
+    assert isinstance(detect_schema(form(typed_properties(1))), DecisionSchema)

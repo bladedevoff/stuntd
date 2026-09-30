@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stuntd"
-version = "0.1.1"
+version = "0.1.2"
 description = "Local proxy that learns your app's typed LLM decisions and answers them with a Laya head. Jev and OpenAI compatible."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "anyio>=4", "ruff>=0.6", "mypy>=1.10", "hypothesis>=6.100", "mutmut>=3", "pyright>=1.1.380", "typesafe-sdk>=0.7"]
+dev = ["pytest>=8", "anyio>=4", "ruff>=0.6", "mypy>=1.10", "hypothesis>=6.100", "mutmut>=3", "pyright>=1.1.380", "typesafe-sdk>=0.7", "anthropic>=0.40"]
 train = ["laya>=0.3.4"]
 
 [project.urls]

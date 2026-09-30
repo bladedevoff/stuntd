@@ -240,6 +240,9 @@ def test_unusable_schema_is_refused(data_dir, tmp_path, capsys):
     assert "stuntd: --schema is not valid JSON" in capsys.readouterr().err
     assert main(["import", "spam", path, "--schema", '{"type": "object"}']) == 2
     assert "stuntd: schema must describe an object with one typed field" in capsys.readouterr().err
+    two_fields = '{"type":"object","properties":{"a":{"type":"boolean"},"b":{"type":"boolean"}}}'
+    assert main(["import", "spam", path, "--schema", two_fields]) == 2
+    assert "stuntd: schema must describe an object with one typed field" in capsys.readouterr().err
 
 
 def test_missing_file_is_reported(data_dir, tmp_path, capsys):

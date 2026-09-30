@@ -205,6 +205,17 @@ def test_comparisons_count_the_limit_in_comparisons(tmp_path):
     assert [row.confidence for row in rows] == [0.2, 0.1]
 
 
+def test_captures_since_counts_one_site_after_a_time(tmp_path, monkeypatch):
+    store = Store(tmp_path / "c.sqlite", Redactor())
+    for moment, site in ((10.0, "s1"), (20.0, "s1"), (30.0, "s1"), (30.0, "s2")):
+        monkeypatch.setattr(time, "time", lambda moment=moment: moment)
+        store.record(make(site=site))
+    assert store.captures_since("s1", 10.0) == 2
+    assert store.captures_since("s1", 0.0) == 3
+    assert store.captures_since("s1", 30.0) == 0
+    store.close()
+
+
 def test_comparisons_reject_zero_limit(tmp_path):
     store = Store(tmp_path / "c.sqlite", Redactor())
     with pytest.raises(ValueError):

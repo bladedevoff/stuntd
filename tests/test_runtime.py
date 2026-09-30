@@ -538,3 +538,13 @@ def test_promote_logs_a_file_failure_instead_of_raising(models, store, monkeypat
         assert runtime.promote_if_allowed(runtime.state("s1")) is False
     assert "promotion check failed" in caplog.text
     assert read_mode(folder) == (MODE_SHADOW, None)
+
+
+@pytest.mark.anyio
+async def test_live_fields_samples_the_request_once_for_all_fields(models, store):
+    save_model(models, model(site="s1"))
+    save_model(models, model(site="s2"))
+    runtime = runtime_for(models, store, FakeDecider(), check_share=0.9999)
+    states = [runtime.state("s1"), runtime.state("s2")]
+    outcomes = await runtime.live_fields(states, "user: hi", "s")
+    assert [(o.mode, o.reason) for o in outcomes] == [(MODE_COLLECT, "check")] * 2

@@ -25,6 +25,7 @@ from stuntd.serve.modes import (
     write_mode,
 )
 from stuntd.serve.monitor import window_agreement, window_start
+from stuntd.serve.retrain import last_result
 from stuntd.settings import (
     CONFIG_TEMPLATE,
     Settings,
@@ -45,7 +46,7 @@ if TYPE_CHECKING:
 
 __all__ = ["main"]
 
-_COLUMN_WIDTHS = (18, 8, 9, 8, 6)
+_COLUMN_WIDTHS = (18, 8, 9, 8, 6, 10)
 _CONFIG_HELP = "settings file to read instead of the one in the data directory"
 _IMPORT_MODEL = "import"
 _COVERAGE_DIGITS = 2
@@ -65,6 +66,7 @@ class _SiteStatus:
     shadow: int
     live: int
     agreement: float | None
+    retrain: str | None
 
 
 class _LearningOff(Exception):
@@ -80,7 +82,7 @@ def _make_decider(settings: Settings) -> DeciderLike:
     # The only place serving reaches torch and laya, so every other command runs without the extra.
     from stuntd.serve.decider import Decider
 
-    return Decider(settings.base_model, settings.device)
+    return Decider(settings.base_model, settings.device, settings.lazy_load)
 
 
 def _require_serving() -> None:
@@ -115,6 +117,7 @@ def _serving_sites(models: Path) -> list[tuple[str, SiteModel]]:
 
 def _serve(args: argparse.Namespace) -> int:
     settings = _load(args.config, args.upstream, args.port)
+    settings.lazy_load = settings.lazy_load or args.lazy
     import uvicorn
 
     from stuntd.proxy.app import build_app
@@ -125,13 +128,14 @@ def _serve(args: argparse.Namespace) -> int:
     # The base model loads before anything is printed: it takes seconds, and a checkpoint that
     # will not load must fail the command rather than leave a line promising a proxy that is up.
     decider = _serve_decider(settings, len(serving))
-    if decider is not None and serving:
-        # The first pass through a freshly loaded model is far slower than the rest, so one site
-        # pays for it here rather than the first caller of whichever site asks first.
-        site, model = serving[0]
-        decider.warm(model, site_dir(models, site) / HEAD_FILE)
-    elif decider is not None:
-        decider.warm_base()
+    if decider is not None and not settings.lazy_load:
+        if serving:
+            # The first pass through a freshly loaded model is far slower than the rest, so one
+            # site pays for it here rather than the first caller of whichever site asks first.
+            site, model = serving[0]
+            decider.warm(model, site_dir(models, site) / HEAD_FILE)
+        else:
+            decider.warm_base()
     # uvicorn.run never returns while the daemon is up, so a piped stdout needs the lines now.
     listening = f"stuntd listening on http://{settings.host}:{settings.port}"
     if settings.upstream:
@@ -141,13 +145,14 @@ def _serve(args: argparse.Namespace) -> int:
         print("no upstream: only the Jev routes are served", flush=True)
     if decider is not None:
         served = f"{len(serving)} site(s)" if serving else "jev locally"
-        print(f"serving {served} with {settings.base_model}", flush=True)
+        loading = ", loading on first use" if settings.lazy_load else ""
+        print(f"serving {served} with {settings.base_model}{loading}", flush=True)
     if not settings.learn:
         print("learning off", flush=True)
     # The relay is byte-exact, so uvicorn must not put its own Date and Server headers next to
     # the ones the provider sent.
     uvicorn.run(
-        build_app(settings, decider=decider),
+        build_app(settings, decider=decider, config=_config_file(args.config)),
         host=settings.host,
         port=settings.port,
         log_level="warning",
@@ -217,7 +222,7 @@ def _status(args: argparse.Namespace) -> int:
     if not rows:
         print("no captures yet")
         return 0
-    print(_row("site", "mode", "captures", "shadow", "live", "agreement"))
+    print(_row("site", "mode", "captures", "shadow", "live", "agreement", "retrain"))
     for row in rows:
         print(_status_line(row))
     return 0
@@ -351,7 +356,7 @@ def _decision_schema(schema: object) -> DecisionSchema:
     found = detect_schema(
         {"response_format": {"type": "json_schema", "json_schema": {"schema": schema}}}
     )
-    if found is None:
+    if not isinstance(found, DecisionSchema):
         raise ValueError("schema must describe an object with one typed field")
     return found
 
@@ -565,11 +570,17 @@ def _gold_report(settings: Settings, site: str, path: Path, as_json: bool) -> in
 
 
 def _row(
-    site: object, mode: object, captures: object, shadow: object, live: object, agreement: object
+    site: object,
+    mode: object,
+    captures: object,
+    shadow: object,
+    live: object,
+    agreement: object,
+    retrain: object,
 ) -> str:
     # The space past each pad keeps the columns apart when a value fills its width.
-    columns = zip((site, mode, captures, shadow, live), _COLUMN_WIDTHS, strict=True)
-    return "".join(f"{value:<{width - 1}} " for value, width in columns) + str(agreement)
+    columns = zip((site, mode, captures, shadow, live, agreement), _COLUMN_WIDTHS, strict=True)
+    return "".join(f"{value:<{width - 1}} " for value, width in columns) + str(retrain)
 
 
 def _status_line(row: _SiteStatus) -> str:
@@ -582,6 +593,7 @@ def _status_line(row: _SiteStatus) -> str:
         row.shadow if served else "-",
         row.live if served else "-",
         "-" if row.agreement is None else f"{row.agreement:.3f}",
+        row.retrain or "-",
     )
 
 
@@ -598,7 +610,7 @@ def _agreement(store: Store, site: str, state: SiteState | None, window: int) ->
 
 
 def _row_without_captures(state: SiteState) -> _SiteStatus:
-    return _SiteStatus(state.site, state.mode, 0, 0, 0, None)
+    return _SiteStatus(state.site, state.mode, 0, 0, 0, None, last_result(state.site))
 
 
 def _status_rows(settings: Settings) -> list[_SiteStatus]:
@@ -626,6 +638,7 @@ def _status_rows(settings: Settings) -> list[_SiteStatus]:
                     shadow=_compared(decisions),
                     live=decisions.get(MODE_LIVE, 0),
                     agreement=_agreement(store, site, state, settings.window),
+                    retrain=last_result(site),
                 )
             )
         return rows
@@ -658,6 +671,9 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--config", metavar="PATH", help=_CONFIG_HELP)
     serve.add_argument("--upstream", metavar="URL", help="provider base URL to forward to")
     serve.add_argument("--port", type=int, metavar="N", help="port to listen on")
+    serve.add_argument(
+        "--lazy", action="store_true", help="load the base checkpoint on the first request"
+    )
     serve.set_defaults(handler=_serve)
 
     status = commands.add_parser("status", help="summarise the captures recorded so far")

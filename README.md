@@ -6,11 +6,12 @@
 [![PyPI](https://img.shields.io/pypi/v/stuntd.svg)](https://pypi.org/project/stuntd/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Hugging Face Space](https://img.shields.io/badge/HF%20Space-try%20it-blue.svg)](https://huggingface.co/spaces/pollix/stuntd)
+[![Hugging Face Space](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Space-yellow)](https://huggingface.co/spaces/pollix/stuntd)
 
 **stuntd is a local, self-hosted proxy that records the typed decisions your app already makes and
 learns to answer them itself.** It speaks the Jev System One protocol (`POST /v1/systemone`, with
-`choice`, `score` and `noul` questions) and the OpenAI Chat Completions API, distils each decision
+`choice`, `score` and `noul` questions), the OpenAI Chat Completions API and the Anthropic
+Messages API, distils each decision
 site into a small head on a frozen [Laya](https://huggingface.co/convaiinnovations/laya) encoder,
 and serves that answer locally with calibrated confidence, handing anything it is unsure about back
 to the provider.
@@ -22,8 +23,8 @@ Three ways to run it:
 
 - **Local Jev.** No key, no provider, no training. Point `typesafe-sdk` at stuntd and the base Laya
   checkpoint answers your typed questions.
-- **In front of OpenAI.** A drop-in replacement for the provider base URL. Typed requests are
-  recorded; everything else is relayed byte for byte.
+- **In front of OpenAI or Anthropic.** A drop-in replacement for the provider base URL. Typed
+  requests are recorded; everything else is relayed byte for byte.
 - **In front of the paid Jev API.** stuntd relays, learns from the provider's own answers, and
   takes the decision over once its head is right often enough.
 
@@ -111,8 +112,13 @@ client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key=os.environ["OPENAI_
 ```
 
 Everything keeps working exactly as before. A request whose `response_format` (or single tool) asks
-for an object with one enum, boolean or number field is a typed decision, and stuntd records it
-with the provider's answer. Anything else is relayed untouched, streaming included.
+for an object made only of enum, boolean or number fields is a typed decision, and stuntd records
+it with the provider's answer. Anything else is relayed untouched, streaming included.
+
+An object with several fields, such as `{category, urgency, needs_human}`, learns one head per
+field. Each field is its own site, named `<site>.<field>`, and a request is answered locally only
+when every field's head is live and confident. If one is not, the provider answers and every field
+is recorded.
 
 Once a site has a few hundred captures:
 
@@ -122,6 +128,31 @@ stuntd train                   # one head per site with enough examples
 stuntd report                  # holdout agreement, ECE, the operating point
 stuntd enable <site>           # let that site answer locally
 ```
+
+## Quickstart: in front of Anthropic
+
+```
+pip install "stuntd[train]"
+stuntd config init
+stuntd serve --upstream https://api.anthropic.com
+```
+
+Point the SDK at the daemon; the key and the `anthropic-version` header are forwarded as they are:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(base_url="http://127.0.0.1:8787")
+```
+
+A non-streaming `POST /v1/messages` that asks for a JSON schema through `output_config.format`, or
+for a single tool with an `input_schema`, is a typed decision on the same terms as the OpenAI path.
+The same decision asked through either provider lands on the same site and shares one head. A
+streaming request, or a request with tools and a free-text reply, is relayed untouched. Claude
+Code and the Agent SDK reach the daemon through `ANTHROPIC_BASE_URL`.
+
+The local answer is checked against the `anthropic` SDK's `Message` model in the tests, but no live
+Anthropic key has been run through stuntd.
 
 ## Numbers
 
@@ -206,11 +237,13 @@ are what it is measured against.
 ```
 
 A **decision site** is one place in your code that makes one decision. On the Jev path the site is
-the question's name. On the OpenAI path it is a hash of the response schema and the system prompt,
-or whatever you put in the `X-Stuntd-Site` request header.
+the question's name. On the OpenAI and Anthropic paths it is a hash of the response schema and the system prompt,
+or whatever you put in the `X-Stuntd-Site` request header. A request with several typed fields
+gives each field its own site, `<site>.<field>`.
 
 Keep one decision to a question. A question that mixes two, such as "is it urgent and which team
-handles it", learns worse than two separate questions.
+handles it", learns worse than two separate questions. On the OpenAI and Anthropic paths, put the
+two decisions in two fields of one object instead: each gets its own head.
 
 Each site walks through four modes.
 
@@ -230,6 +263,13 @@ Each site walks through four modes.
    what keeps the head honest: once agreement over the last `window` decisions falls below
    `target_agreement`, the site demotes itself back to shadow and logs why. Promotion the other way
    is manual unless you set `serving.auto_promote`.
+
+With `serving.auto_promote` and `training.auto_retrain` both set, the loop closes: collect, train,
+shadow, promote, demote, and retrain once `auto_retrain` new captures have arrived since the head
+was trained. The daemon runs `stuntd train` for the site as a child process, one at a time, and
+the new head starts in shadow like any other. A failed run is logged with its exit code and is not
+retried until another `auto_retrain` captures arrive; serving carries on meanwhile. `stuntd status`
+shows how the last automatic run ended.
 
 In proxy mode the provider behind `[jev] upstream` does not have to be the paid API. Any server
 that speaks `POST /v1/systemone` can sit there -- kev, LLM2Jev, the laya-server family -- which
@@ -284,7 +324,7 @@ X-Stuntd: passthrough; reason=no-schema
 | mode | `live`, `shadow`, `collect`, `passthrough` |
 | `site=` | the decision site this request landed on |
 | `confidence=` | the head's calibrated confidence, two decimals, on a live answer |
-| `reason=` | `no-schema`, `streaming`, `learning-off`, `no-upstream`, `low-confidence`, `check`, `retrained`, `model-error`, `no-runtime`, `state-error`, `upstream-error` |
+| `reason=` | `no-schema`, `streaming`, `learning-off`, `no-upstream`, `low-confidence`, `check`, `retrained`, `model-error`, `no-runtime`, `state-error`, `upstream-error`; on a multi-field request `low-confidence:<field>` and `not-live:<field>` name the field that kept it from being local |
 
 On the Jev path: the mode it served in, then how the questions were answered.
 
@@ -332,12 +372,14 @@ from. Every key is optional and a missing one keeps the default.
 | `training.cache_encoder` | `true` | Whether the frozen encoder runs once per example instead of once per epoch; off re-encodes. |
 | `training.cache_max_mb` | `0` | Most memory the cached encoder output may take, in megabytes; 0 is half of physical memory. A bigger site trains uncached and says so on stderr. |
 | `training.max_option_tokens` | `1024` | How far a site with many or long labels may widen the option budget, in tokens, so every label is shown whole; past it, labels are cut short. A value below the checkpoint's own budget (192) keeps the checkpoint's. |
+| `training.auto_retrain` | `0` | New captures a site needs after its head was trained before the daemon trains it again in the background; 0 leaves training to `stuntd train`. A site without a head first needs `min_examples`. |
 | `serving.check_share` | `0.02` | Share of live requests still sent to the provider to check the head. Inert in local Jev mode. |
 | `serving.window` | `100` | Recent decisions a site is judged on. |
 | `serving.min_window` | `20` | Decisions needed before that judgement counts. |
 | `serving.auto_promote` | `false` | Whether a shadow site that holds its target goes live on its own. |
 | `serving.auto_promote_after_hours` | `24` | Hours in shadow before it may. |
 | `serving.cache_size` | `1000` | Answers kept in memory, one LRU cache shared by every site. |
+| `serving.lazy_load` | `false` | Whether the base checkpoint loads on the first request instead of at startup. A failed load answers that request from the provider and is retried on the next one. `stuntd serve --lazy` sets it. |
 | `jev.upstream` | `""` | Origin of the paid Jev provider, no path. Empty: the base Laya answers locally. |
 | `jev.require_key` | `false` | Whether a Jev request must carry a Bearer token. The token itself is not checked. |
 | `jev.model_name` | `stuntd` | Name reported in the `model` field of a Jev answer. |
@@ -381,7 +423,7 @@ The same decision, written as a sentence about the customer's own history, reach
 coverage 0.57. If your decision is really a calculation, write the calculation, not a model.
 
 - **Free text is not a decision.** stuntd learns closed decisions only: an enum, a boolean or a
-  number on the OpenAI path, `choice`, `noul` or `score` on the Jev path. A request that asks for
+  number on the OpenAI and Anthropic paths, `choice`, `noul` or `score` on the Jev path. A request that asks for
   prose, a summary or code is relayed and never recorded.
 - **A site needs examples.** `training.min_examples` is 300 and the demos use 3000 rows. A rare
   decision, or one whose option list changes every week, is not a fit.
@@ -390,9 +432,12 @@ coverage 0.57. If your decision is really a calculation, write the calculation, 
   reaches a 0.935 holdout agreement and answers 71% of the tickets at 99.1% agreement, handing the
   other 29% to the provider. That is a working site rather than a failure, but it is the shape to
   expect when the labels are not cleanly separated by words.
-- **Only the OpenAI Chat Completions path learns.** Anthropic Messages, the OpenAI Responses API
-  and Gemini pass through untouched. Claude Code, Codex CLI and Gemini CLI run through stuntd as if
-  it were not there.
+- **OpenAI Chat Completions and Anthropic Messages learn.** The OpenAI Responses API and Gemini
+  pass through untouched, and so does any streaming request. Codex CLI and Gemini CLI run through
+  stuntd as if it were not there.
+- **A multi-field decision needs every field typed, at most 8.** One property that is free text,
+  an array or a nested object makes the whole request free text, and it is relayed and never
+  recorded. A property the provider leaves out is not recorded for that request.
 
 ### Details worth knowing
 
@@ -414,11 +459,13 @@ coverage 0.57. If your decision is really a calculation, write the calculation, 
   `stuntd report`, which measures the head against held-out rows, is the quality signal there. Put
   a Jev provider in front and both come back.
 - **One CUDA workload at a time.** Stop the daemon before `stuntd train`, or the two contend for
-  the same GPU.
-- **Every `serve` loads the base checkpoint** when `[jev] upstream` is empty, because local Jev
-  answers from it. The daemon runs one pass through the model before it accepts requests, so
-  startup costs seconds and the first request then runs close to the steady-state p50. Lazy
-  loading is on the roadmap.
+  the same GPU. The same holds for `training.auto_retrain`: the training run it starts shares the
+  GPU with serving unless `training.device` is `cpu`.
+- **Every `serve` loads the base checkpoint** at startup, because local Jev answers from it and a
+  live head needs it. The daemon runs one pass through the model before it accepts requests, so
+  startup costs seconds and the first request then runs close to the steady-state p50. With
+  `serving.lazy_load` or `serve --lazy` it loads on the first request instead, and that request
+  pays for the load.
 - **The first start needs the network.** `serve` and `train` load `training.base_model`, which
   defaults to the Hub id, so the first run downloads the whole repository, the `multilingual/`
   and `typed-decisions/` checkpoints included. With `HF_HUB_OFFLINE=1` the Hub id loads only
@@ -478,23 +525,22 @@ Jev-compatible server above -- the laya-server family, kev, LLM2Jev -- can sit b
 
 Next: support for new formats.
 
-- Adapters for Anthropic Messages, the OpenAI Responses API and Gemini, so those paths learn too.
+- Adapters for the OpenAI Responses API and Gemini, so those paths learn too.
 
 Later:
 
-- Lazy checkpoint load, so a daemon that serves nothing locally starts at once.
 - Encode the state once per request instead of once per question, for multi-question latency.
 - Option-order augmentation during training.
 - Dynamic candidate options, so a site whose option list changes does not need a new head.
 - Export a trained site as a full Laya checkpoint.
 - Unfreezing the top encoder layers, for decisions a frozen encoder cannot read.
-- `stuntd train` on a schedule.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). `make check` is what CI runs: `ruff format --check`,
-`ruff check`, `mypy`, `pyright` and `pytest`. The same file for LLM contributors is
-[AGENTS.md](AGENTS.md).
+Questions and show and tell go to [Discussions](https://github.com/bladedevoff/stuntd/discussions),
+bugs to issues. See [CONTRIBUTING.md](CONTRIBUTING.md). `make check` is what CI runs:
+`ruff format --check`, `ruff check`, `mypy`, `pyright` and `pytest`. The same file for LLM
+contributors is [AGENTS.md](AGENTS.md).
 
 ## License
 

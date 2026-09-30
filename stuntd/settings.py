@@ -66,6 +66,9 @@ CONFIG_TEMPLATE = """# stuntd settings. Every key is optional; a missing key kee
 # How far the option budget may widen, in tokens, so a site's labels fit whole; past it, labels
 # are cut short. Below the checkpoint's own budget (192) it has no effect.
 # max_option_tokens = 1024
+# New captures a site needs after its model was trained before the daemon trains it again in the
+# background; 0 leaves training to `stuntd train`. A site without a model first needs min_examples.
+# auto_retrain = 0
 
 [serving]
 # Share of the requests a serving site still sends to the provider to check its own answer.
@@ -80,6 +83,9 @@ CONFIG_TEMPLATE = """# stuntd settings. Every key is optional; a missing key kee
 # auto_promote_after_hours = 24
 # Answers kept in memory, in one cache shared by every site, dropping the least recently used.
 # cache_size = 1000
+# Whether the base checkpoint loads on the first request instead of at startup; a failed load
+# answers that request from the provider and is retried on the next one.
+# lazy_load = false
 
 [jev]
 # Origin of the Jev provider answers are fetched from: the origin only, no path. Left empty, the
@@ -113,6 +119,7 @@ _SECTIONS = {
         "cache_encoder": bool,
         "cache_max_mb": int,
         "max_option_tokens": int,
+        "auto_retrain": int,
     },
     "serving": {
         "check_share": float,
@@ -121,6 +128,7 @@ _SECTIONS = {
         "auto_promote": bool,
         "auto_promote_after_hours": int,
         "cache_size": int,
+        "lazy_load": bool,
     },
     "jev": {"upstream": str, "require_key": bool, "model_name": str},
 }
@@ -186,6 +194,9 @@ class Settings:
     max_option_tokens: int = 1024
     """Most tokens the option budget may widen to; below the checkpoint's own it has no effect."""
 
+    auto_retrain: int = 0
+    """New captures after which the daemon trains a site again in the background; 0 is off."""
+
     check_share: float = 0.02
     """Share of the requests a serving site still sends to the provider to check its own answer,
     ignored in local Jev mode, where there is no provider to check it against."""
@@ -204,6 +215,9 @@ class Settings:
 
     cache_size: int = 1000
     """Answers kept in one cache shared by every site, dropping the least recently used."""
+
+    lazy_load: bool = False
+    """Whether the base checkpoint loads on the first request instead of at startup."""
 
     learn: bool = True
     """Whether captures, models and decisions are written at all."""
@@ -322,6 +336,7 @@ def load_settings(path: Path | None = None, overrides: dict[str, Any] | None = N
     settings.max_option_tokens = values.get(
         "training.max_option_tokens", settings.max_option_tokens
     )
+    settings.auto_retrain = values.get("training.auto_retrain", settings.auto_retrain)
     settings.check_share = values.get("serving.check_share", settings.check_share)
     settings.window = values.get("serving.window", settings.window)
     settings.min_window = values.get("serving.min_window", settings.min_window)
@@ -330,6 +345,7 @@ def load_settings(path: Path | None = None, overrides: dict[str, Any] | None = N
         "serving.auto_promote_after_hours", settings.auto_promote_after_hours
     )
     settings.cache_size = values.get("serving.cache_size", settings.cache_size)
+    settings.lazy_load = values.get("serving.lazy_load", settings.lazy_load)
     settings.learn = values.get("learn", settings.learn)
     settings.jev_upstream = values.get("jev.upstream", settings.jev_upstream)
     settings.jev_require_key = values.get("jev.require_key", settings.jev_require_key)
@@ -363,6 +379,8 @@ def load_settings(path: Path | None = None, overrides: dict[str, Any] | None = N
         raise ValueError(
             f"max_option_tokens must be at least 1, got {settings.max_option_tokens!r}"
         )
+    if settings.auto_retrain < 0:
+        raise ValueError(f"auto_retrain cannot be negative, got {settings.auto_retrain!r}")
     if settings.device not in _DEVICES:
         raise ValueError(f"device must be one of {', '.join(_DEVICES)}, got {settings.device!r}")
     if not 0 <= settings.check_share < 1:

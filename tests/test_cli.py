@@ -39,6 +39,17 @@ def test_status_json_lists_no_sites_without_db(data_dir, capsys):
     assert json.loads(capsys.readouterr().out) == {"learning": True, "sites": []}
 
 
+def test_status_lists_the_field_sites_of_a_multi_field_decision(data_dir, capsys):
+    data_dir.mkdir(parents=True, exist_ok=True)
+    store = Store(data_dir / "captures.sqlite", Redactor())
+    for field in ("category", "urgent"):
+        store.record(Capture(f"triage.{field}", "{}", "choice", "user: x", "a", "gpt-x", 100, 1, 1))
+    store.close()
+    assert main(["status", "--json"]) == 0
+    sites = json.loads(capsys.readouterr().out)["sites"]
+    assert [row["site"] for row in sites] == ["triage.category", "triage.urgent"]
+
+
 def test_status_columns_stay_separated(data_dir, capsys):
     data_dir.mkdir(parents=True, exist_ok=True)
     store = Store(data_dir / "captures.sqlite", Redactor())
@@ -538,8 +549,16 @@ def test_status_shows_a_site_without_a_model_as_collecting(data_dir, capsys):
     seed_captures(data_dir)
     assert main(["status"]) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert lines[0].split() == ["site", "mode", "captures", "shadow", "live", "agreement"]
-    assert lines[1].split() == ["s1", "collect", "10", "-", "-", "-"]
+    assert lines[0].split() == [
+        "site",
+        "mode",
+        "captures",
+        "shadow",
+        "live",
+        "agreement",
+        "retrain",
+    ]
+    assert lines[1].split() == ["s1", "collect", "10", "-", "-", "-", "-"]
     assert main(["status", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {
         "learning": True,
@@ -551,6 +570,7 @@ def test_status_shows_a_site_without_a_model_as_collecting(data_dir, capsys):
                 "shadow": 0,
                 "live": 0,
                 "agreement": None,
+                "retrain": None,
             }
         ],
     }
@@ -570,7 +590,15 @@ def test_status_shows_modes_counts_and_agreement(data_dir, capsys, monkeypatch):
     assert json.loads(capsys.readouterr().out) == {
         "learning": True,
         "sites": [
-            {"site": "s1", "mode": "live", "captures": 10, "shadow": 2, "live": 1, "agreement": 0.5}
+            {
+                "site": "s1",
+                "mode": "live",
+                "captures": 10,
+                "shadow": 2,
+                "live": 1,
+                "agreement": 0.5,
+                "retrain": None,
+            }
         ],
     }
     assert main(["status"]) == 0
@@ -581,7 +609,21 @@ def test_status_shows_modes_counts_and_agreement(data_dir, capsys, monkeypatch):
         "2",
         "1",
         "0.500",
+        "-",
     ]
+
+
+def test_status_shows_how_the_last_automatic_training_ended(data_dir, capsys):
+    data_dir.mkdir(parents=True, exist_ok=True)
+    store = Store(data_dir / "captures.sqlite", Redactor())
+    store.record(Capture("s1", "{}", "choice", "user: x", "block", "gpt-x", 100, 1, 1))
+    store.close()
+    (data_dir / "logs").mkdir()
+    (data_dir / "logs" / "train-s1.result").write_text("failed (exit 1)", encoding="utf-8")
+    assert main(["status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["sites"][0]["retrain"] == "failed (exit 1)"
+    assert main(["status"]) == 0
+    assert capsys.readouterr().out.splitlines()[1].split()[-3:] == ["failed", "(exit", "1)"]
 
 
 def test_serve_builds_a_decider_for_a_serving_site(data_dir, capsys, monkeypatch):
@@ -644,6 +686,28 @@ def test_serve_warms_nothing_when_every_site_collects(data_dir, capsys, monkeypa
     assert decider.warmed == []
     assert decider.warmed_base
     assert "serving jev locally with convaiinnovations/laya" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("via_flag", [True, False], ids=["flag", "config"])
+def test_serve_skips_warming_and_says_the_model_loads_on_first_use(
+    data_dir, capsys, monkeypatch, via_flag
+):
+    seed_captures(data_dir)
+    if not via_flag:
+        write_config(data_dir, "[serving]\nlazy_load = true\n")
+    decider = WarmingDecider()
+    recorded = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: recorded.update(app=app))
+    monkeypatch.setattr("stuntd.cli._make_decider", lambda settings: decider)
+    argv = ["serve", "--upstream", "http://127.0.0.1:9"]
+    assert main([*argv, "--lazy"] if via_flag else argv) == 0
+    recorded["app"].state.store.close()
+    assert decider.warmed == []
+    assert not decider.warmed_base
+    assert (
+        "serving jev locally with convaiinnovations/laya, loading on first use"
+        in capsys.readouterr().out
+    )
 
 
 def test_serve_without_torch_reports_serving_disabled(data_dir, capsys, monkeypatch):
@@ -709,11 +773,20 @@ def test_status_shows_a_trained_site_without_a_database(data_dir, capsys, monkey
                 "shadow": 0,
                 "live": 0,
                 "agreement": None,
+                "retrain": None,
             }
         ],
     }
     assert main(["status"]) == 0
-    assert capsys.readouterr().out.splitlines()[1].split() == ["s1", "shadow", "0", "0", "0", "-"]
+    assert capsys.readouterr().out.splitlines()[1].split() == [
+        "s1",
+        "shadow",
+        "0",
+        "0",
+        "0",
+        "-",
+        "-",
+    ]
     assert not (data_dir / "captures.sqlite").exists()
 
 

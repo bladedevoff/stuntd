@@ -106,6 +106,7 @@ def test_malformed_toml_names_the_file(tmp_path):
         ({"min_window": 200, "window": 100}, "min_window must be between 1 and 100, got 200"),
         ({"auto_promote_after_hours": -1}, "auto_promote_after_hours must be at least 0, got -1"),
         ({"cache_size": -1}, "cache_size must be at least 0, got -1"),
+        ({"auto_retrain": -1}, "auto_retrain cannot be negative, got -1"),
     ],
     ids=[
         "port-zero",
@@ -124,6 +125,7 @@ def test_malformed_toml_names_the_file(tmp_path):
         "min-window-over-window",
         "promote-hours",
         "cache-size",
+        "auto-retrain",
     ],
 )
 def test_out_of_range_values_are_rejected(override, message):
@@ -201,6 +203,28 @@ def test_option_budget_comes_from_the_file(tmp_path, line, expected):
     cfg = tmp_path / "stuntd.toml"
     cfg.write_text(f"[training]\n{line}", encoding="utf-8")
     assert load_settings(cfg).max_option_tokens == expected
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [("", 0), ("auto_retrain = 200\n", 200)],
+    ids=["off", "custom"],
+)
+def test_automatic_retraining_comes_from_the_file(tmp_path, line, expected):
+    cfg = tmp_path / "stuntd.toml"
+    cfg.write_text(f"[training]\n{line}", encoding="utf-8")
+    assert load_settings(cfg).auto_retrain == expected
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [("", False), ("lazy_load = true\n", True)],
+    ids=["eager", "lazy"],
+)
+def test_lazy_load_comes_from_the_file(tmp_path, line, expected):
+    cfg = tmp_path / "stuntd.toml"
+    cfg.write_text(f"[serving]\n{line}", encoding="utf-8")
+    assert load_settings(cfg).lazy_load is expected
 
 
 @pytest.mark.parametrize("value", [0, -1], ids=["zero", "negative"])

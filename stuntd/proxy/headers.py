@@ -46,7 +46,7 @@ DROPPED_WHEN_BUFFERED = frozenset({b"x-stuntd"})
 # A site name reaches this header from a request header of the caller's, so a value carrying
 # CR or LF would let them append a header of their own. fullmatch, not $, which would also
 # accept a trailing newline.
-_TOKEN = re.compile(r"[A-Za-z0-9_.-]+")
+_TOKEN = re.compile(r"[A-Za-z0-9_.:-]+")
 
 
 def _token(value: str) -> str:

@@ -8,7 +8,14 @@ import httpx
 if TYPE_CHECKING:
     from stuntd.decisions.schema import DecisionSchema
 
-__all__ = ["decoded_json", "extract_answer", "token_count", "usage_tokens"]
+__all__ = [
+    "decoded_json",
+    "extract_answer",
+    "extract_message_answer",
+    "message_usage_tokens",
+    "token_count",
+    "usage_tokens",
+]
 
 
 def _answered_value(schema: DecisionSchema, response_json: dict[str, Any]) -> object:
@@ -19,6 +26,23 @@ def _answered_value(schema: DecisionSchema, response_json: dict[str, Any]) -> ob
             return None
         return json.loads(function["arguments"])[schema.field]
     return json.loads(message["content"])[schema.field]
+
+
+def _message_value(schema: DecisionSchema, response_json: dict[str, Any]) -> object:
+    blocks = response_json["content"]
+    if schema.source == "tool":
+        block = next(b for b in blocks if b["type"] == "tool_use" and b["name"] == schema.tool_name)
+        return block["input"][schema.field]
+    block = next(b for b in blocks if b["type"] == "text")
+    return json.loads(block["text"])[schema.field]
+
+
+def _label(value: object) -> str | None:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float, str)):
+        return str(value)
+    return None
 
 
 def token_count(value: object) -> int | None:
@@ -46,11 +70,7 @@ def extract_answer(schema: DecisionSchema, response_json: dict[str, Any]) -> str
         value = _answered_value(schema, response_json)
     except (KeyError, IndexError, TypeError, ValueError):
         return None
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float, str)):
-        return str(value)
-    return None
+    return _label(value)
 
 
 def usage_tokens(response_json: dict[str, Any]) -> tuple[int | None, int | None]:
@@ -59,3 +79,20 @@ def usage_tokens(response_json: dict[str, Any]) -> tuple[int | None, int | None]
     if not isinstance(usage, dict):
         return None, None
     return token_count(usage.get("prompt_tokens")), token_count(usage.get("completion_tokens"))
+
+
+def extract_message_answer(schema: DecisionSchema, response_json: dict[str, Any]) -> str | None:
+    """The typed field a Messages response filled in, as a string, or None if it does not carry it."""
+    try:
+        value = _message_value(schema, response_json)
+    except (KeyError, StopIteration, TypeError, ValueError):
+        return None
+    return _label(value)
+
+
+def message_usage_tokens(response_json: dict[str, Any]) -> tuple[int | None, int | None]:
+    """The input and output counts a Messages response reported, each None unless it was an int."""
+    usage = response_json.get("usage")
+    if not isinstance(usage, dict):
+        return None, None
+    return token_count(usage.get("input_tokens")), token_count(usage.get("output_tokens"))

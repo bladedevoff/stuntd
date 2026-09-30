@@ -162,7 +162,7 @@ async def test_rejected_site_header_falls_back_to_the_hashed_key(proxy):
     r = await client.post(
         "/v1/chat/completions", json=MOD_REQUEST, headers={"X-Stuntd-Site": "../evil"}
     )
-    hashed = site_key(detect_schema(MOD_REQUEST), MOD_REQUEST["messages"])
+    hashed = site_key(detect_schema(MOD_REQUEST), "Moderate.")
     assert r.headers["x-stuntd"] == f"collect; site={hashed}"
     assert [entry["site"] for entry in app.state.store.stats()] == [hashed]
 
@@ -170,7 +170,7 @@ async def test_rejected_site_header_falls_back_to_the_hashed_key(proxy):
 async def test_dots_only_site_header_falls_back_to_the_hashed_key(proxy):
     client, app = proxy
     r = await client.post("/v1/chat/completions", json=MOD_REQUEST, headers={"X-Stuntd-Site": ".."})
-    hashed = site_key(detect_schema(MOD_REQUEST), MOD_REQUEST["messages"])
+    hashed = site_key(detect_schema(MOD_REQUEST), "Moderate.")
     assert r.headers["x-stuntd"] == f"collect; site={hashed}"
     assert [entry["site"] for entry in app.state.store.stats()] == [hashed]
 
