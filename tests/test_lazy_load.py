@@ -2,9 +2,9 @@ import threading
 import time
 
 import pytest
-import torch
 
-from stuntd.serve.decider import Decider
+torch = pytest.importorskip("torch")
+Decider = pytest.importorskip("stuntd.serve.decider").Decider
 
 
 class FakeAgent:
