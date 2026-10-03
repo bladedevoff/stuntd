@@ -1,6 +1,6 @@
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
 import pytest
@@ -48,6 +48,7 @@ class FakeVerdict:
     confidence: float
     latency_ms: int
     probabilities: tuple[float, ...]
+    novelty: float | None = None
 
 
 SURE_ANGRY = FakeVerdict(1, 0.9, 7, (0.25, 0.75))
@@ -242,6 +243,45 @@ async def test_a_head_below_its_threshold_answers_zero_shot(serving):
     assert list(decider.batches[0]) == ["tone"]
     assert response.headers["x-stuntd"] == "jev; mode=local; questions=1; live=0; zeroshot=1"
     assert app.state.store.decisions("tone", 10) == []
+
+
+async def test_a_request_unlike_the_training_rows_answers_zero_shot(serving):
+    decider = FakeDecider(verdict=FakeVerdict(1, 0.9, 7, (0.25, 0.75), 0.5))
+    app = serving(decider, model=replace(site_model("tone"), novelty_cutoff=0.3), mode=MODE_LIVE)
+    response = await post(app, {"tone": TONE})
+    assert json.loads(response.content)["answers"]["tone"] == CHOICE_ANSWER
+    assert response.headers["x-stuntd"] == "jev; mode=local; questions=1; live=0; zeroshot=1"
+    assert app.state.store.decisions("tone", 10) == []
+
+
+async def test_a_head_below_its_threshold_answers_when_the_fallback_is_the_head(serving):
+    decider = FakeDecider(verdict=FakeVerdict(1, 0.4, 7, (0.25, 0.75)))
+    app = serving(decider, model=site_model("tone"), mode=MODE_LIVE, local_fallback="head")
+    response = await post(app, {"tone": TONE})
+    assert json.loads(response.content)["answers"]["tone"]["choice"] == "angry"
+    assert decider.batches == []
+    assert response.headers["x-stuntd"] == "jev; mode=local; questions=1; live=1; zeroshot=0"
+    assert [row.mode for row in app.state.store.decisions("tone", 10)] == ["live"]
+
+
+async def test_a_request_unlike_the_training_rows_answers_when_the_fallback_is_the_head(serving):
+    decider = FakeDecider(verdict=FakeVerdict(1, 0.9, 7, (0.25, 0.75), 0.5))
+    app = serving(
+        decider,
+        model=replace(site_model("tone"), novelty_cutoff=0.3),
+        mode=MODE_LIVE,
+        local_fallback="head",
+    )
+    response = await post(app, {"tone": TONE})
+    assert json.loads(response.content)["answers"]["tone"]["choice"] == "angry"
+    assert decider.batches == []
+
+
+async def test_a_shadow_site_answers_zero_shot_when_the_fallback_is_the_head(serving):
+    decider = FakeDecider(verdict=FakeVerdict(1, 0.4, 7, (0.25, 0.75)))
+    app = serving(decider, model=site_model("tone"), mode=MODE_SHADOW, local_fallback="head")
+    response = await post(app, {"tone": TONE})
+    assert json.loads(response.content)["answers"]["tone"] == CHOICE_ANSWER
 
 
 async def test_a_sampled_check_is_still_answered_by_the_head(serving):

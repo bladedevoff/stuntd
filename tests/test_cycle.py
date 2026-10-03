@@ -26,6 +26,7 @@ class FakeVerdict:
     confidence: float
     latency_ms: int
     probabilities: tuple[float, ...] = ()
+    novelty: float | None = None
 
 
 SURE_REFUND = FakeVerdict(1, 1.0, 5)
@@ -171,6 +172,7 @@ async def test_cycle_collects_trains_shadows_serves_and_demotes(data_dir, monkey
         "sites": [
             {
                 "site": SITE,
+                "name": SITE,
                 "mode": MODE_SHADOW,
                 "captures": COLLECTED + 6,
                 "shadow": 6,

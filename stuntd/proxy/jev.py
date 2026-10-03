@@ -13,8 +13,22 @@ from starlette.background import BackgroundTask, BackgroundTasks
 from starlette.requests import Request
 from starlette.responses import Response
 
-from stuntd.jev.answer import choice_answer, error_body, noul_answer, response_body, score_answer
-from stuntd.jev.schema import JevError, Question, SystemOneRequest, kind_for, parse_request
+from stuntd.jev.answer import (
+    answer_label,
+    choice_answer,
+    error_body,
+    noul_answer,
+    response_body,
+    score_answer,
+)
+from stuntd.jev.schema import (
+    JevError,
+    Question,
+    SystemOneRequest,
+    kind_for,
+    laya_question,
+    parse_request,
+)
 from stuntd.jev.state import serialize_state
 from stuntd.proxy.capture import decoded_json, token_count
 from stuntd.proxy.headers import DROPPED_WHEN_BUFFERED, forwardable, jev_header, relayed_headers
@@ -43,7 +57,6 @@ _NO_RUNTIME = "no-runtime"
 _NO_KEY = "no-key"
 _BAD_REQUEST = "bad-request"
 _MODEL_ERROR = "model-error"
-_NOUL_TRUE = 0.5
 _MODEL_DESCRIPTION = "Local Laya heads trained by stuntd on this daemon's own traffic."
 _RELEASE_DATE = "2026-09-22"
 
@@ -113,7 +126,14 @@ class JevRoutes:
         for question in parsed.questions:
             if runtime is not None:
                 state = runtime.state(question.site)
-                outcome = await self._outcome(runtime, question, state, text, check=False)
+                outcome = await self._outcome(
+                    runtime,
+                    question,
+                    state,
+                    text,
+                    check=False,
+                    gated=self._proxy.settings.local_fallback != "head",
+                )
                 head = None if outcome is None else _from_head(question, state, outcome)
                 if outcome is not None and head is not None:
                     answers[question.name] = head
@@ -156,6 +176,7 @@ class JevRoutes:
         text: str,
         *,
         check: bool = True,
+        gated: bool = True,
     ) -> Outcome | None:
         model = state.model
         # A site is named after the question, so a caller who changed its criteria would otherwise
@@ -167,7 +188,7 @@ class JevRoutes:
             or sorted(model.labels) != sorted(question.labels)
         ):
             return None
-        return await runtime.live(state, text, check)
+        return await runtime.live(state, text, check, gated)
 
     async def _proxied(self, request: Request) -> Response:
         body = await request.body()
@@ -323,19 +344,10 @@ async def _zero_shot(
 ) -> tuple[dict[str, Any], int]:
     if not pending:
         return {}, 0
-    questions = {question.name: _laya_question(question) for question in pending}
+    questions = {question.name: laya_question(question.canonical) for question in pending}
     # laya answers in its own untyped shape, which the decider passes through as object.
     reply: Any = await to_thread.run_sync(decider.answer, state, questions)
     return reply["answers"], int(reply["usage"]["input_tokens"])
-
-
-def _laya_question(question: Question) -> dict[str, object]:
-    # laya reads instructions without a default, and a noul question may carry no criteria at all.
-    instructions = question.instructions if question.instructions is not None else ""
-    laya: dict[str, object] = {"type": question.type, "instructions": instructions}
-    if question.criteria is not None:
-        laya["criteria"] = question.criteria
-    return laya
 
 
 def _from_head(question: Question, state: SiteState, outcome: Outcome) -> dict[str, Any] | None:
@@ -384,7 +396,7 @@ def _provider_label(question: Question, answer: object) -> str | None:
     if not isinstance(answer, dict):
         return None
     try:
-        label = _label(answer)
+        label = answer_label(answer)
     except (KeyError, TypeError, ValueError):
         return None
     return label if label in question.labels else None
@@ -395,15 +407,6 @@ def _usage(answered: dict[str, Any]) -> tuple[int | None, int | None]:
     if not isinstance(usage, dict):
         return None, None
     return token_count(usage.get("input_tokens")), token_count(usage.get("output_tokens"))
-
-
-def _label(answer: dict[str, Any]) -> str:
-    if answer["type"] == "choice":
-        return str(answer["choice"])
-    if answer["type"] == "noul":
-        return "true" if float(answer["noul"]) >= _NOUL_TRUE else "false"
-    probabilities: dict[str, float] = answer["probabilities"]
-    return max(probabilities, key=probabilities.__getitem__)
 
 
 def _has_key(request: Request) -> bool:

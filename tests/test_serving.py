@@ -1,7 +1,7 @@
 import gzip
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
 import pytest
@@ -89,6 +89,7 @@ class FakeVerdict:
     confidence: float
     latency_ms: int
     probabilities: tuple[float, ...] = ()
+    novelty: float | None = None
 
 
 SURE = FakeVerdict(1, 0.9, 7)
@@ -289,6 +290,48 @@ async def test_live_site_asks_the_provider_when_the_model_is_unsure(serving):
     assert response.content == UPSTREAM_BODY
     assert response.headers["x-stuntd"] == f"collect; site={SITE}; reason=low-confidence"
     assert [(row["site"], row["count"]) for row in app.state.store.stats()] == [(SITE, 1)]
+
+
+async def test_live_site_asks_the_provider_when_the_request_is_unlike_its_training(serving):
+    provider = Provider()
+    app = serving(
+        provider,
+        site_model=replace(model(), novelty_cutoff=0.3),
+        mode=MODE_LIVE,
+        decider=FakeDecider(verdict=FakeVerdict(1, 0.9, 7, (), 0.5)),
+    )
+    response = await post(app)
+    assert provider.calls == 1
+    assert response.content == UPSTREAM_BODY
+    assert response.headers["x-stuntd"] == f"collect; site={SITE}; reason=novel"
+    assert [(row["site"], row["count"]) for row in app.state.store.stats()] == [(SITE, 1)]
+
+
+async def test_live_site_without_embeddings_answers_whatever_the_request(serving):
+    provider = Provider()
+    app = serving(
+        provider,
+        site_model=model(),
+        mode=MODE_LIVE,
+        decider=FakeDecider(verdict=FakeVerdict(1, 0.9, 7)),
+    )
+    response = await post(app)
+    assert provider.calls == 0
+    assert response.headers["x-stuntd"] == f"live; site={SITE}; confidence=0.90"
+
+
+async def test_live_site_answers_an_unfamiliar_request_with_the_gate_off(serving):
+    provider = Provider()
+    app = serving(
+        provider,
+        site_model=replace(model(), novelty_cutoff=0.3),
+        mode=MODE_LIVE,
+        decider=FakeDecider(verdict=FakeVerdict(1, 0.9, 7, (), 0.5)),
+        novelty_gate=False,
+    )
+    response = await post(app)
+    assert provider.calls == 0
+    assert response.headers["x-stuntd"] == f"live; site={SITE}; confidence=0.90"
 
 
 async def test_live_site_checks_a_sampled_answer_against_the_provider(serving):

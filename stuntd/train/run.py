@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from stuntd.paths import private_dir
-from stuntd.serve.modes import MODE_SHADOW, write_mode
+from stuntd.serve.modes import MODE_LIVE, MODE_SHADOW, read_mode, write_mode
 from stuntd.settings import Settings, models_path
 from stuntd.store.db import SiteInfo, Store
 from stuntd.train.artifacts import HEAD_FILE, SiteModel, site_dir, write_meta
@@ -22,6 +22,8 @@ from stuntd.train.metrics import (
     operating_point,
     per_class,
     predict,
+    quantile,
+    wilson_interval,
 )
 
 __all__ = ["NO_CAPTURES", "TrainResult", "TrainedHead", "Trainer", "train_sites"]
@@ -37,10 +39,11 @@ _log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class TrainedHead:
-    """What a trainer hands back for one site: the holdout logits and the layout it trained with."""
+    """What a trainer hands back for one site: the holdout logits and novelty, and its layout."""
 
     logits: list[list[float]]
     layout: Layout
+    novelty: list[float] | None = None
 
 
 Trainer = Callable[[SiteDataset, Path], TrainedHead]
@@ -110,6 +113,16 @@ def _evaluate(
     predictions = predict(trained.logits, labels, temperature)
     point = operating_point(predictions, settings.target_agreement)
     correct = sum(one.label == one.predicted for one in predictions)
+    n_covered = covered_interval = None
+    if point is not None:
+        n_covered = round(point.coverage * len(predictions))
+        covered_interval = wilson_interval(round(point.agreement * n_covered), n_covered)
+    novelty_cutoff = familiar_share = None
+    if trained.novelty is not None:
+        novelty_cutoff = quantile(trained.novelty, settings.novelty_quantile)
+        familiar_share = sum(value <= novelty_cutoff for value in trained.novelty) / len(
+            trained.novelty
+        )
     return SiteModel(
         site=dataset.site,
         kind=dataset.kind,
@@ -132,6 +145,11 @@ def _evaluate(
         max_len=trained.layout.max_len,
         head_max_len=trained.layout.head_max_len,
         spaced_labels=trained.layout.spaced_labels,
+        agreement_interval=wilson_interval(correct, len(predictions)),
+        covered_interval=covered_interval,
+        n_covered=n_covered,
+        novelty_cutoff=novelty_cutoff,
+        familiar_share=familiar_share,
     )
 
 
@@ -159,7 +177,11 @@ def _train_one(
         _fresh(working)
         model = _evaluate(dataset, trainer(dataset, working / HEAD_FILE), settings, now())
         write_meta(working, model)
-        write_mode(working, MODE_SHADOW, model.trained_at)
+        try:
+            was_live = read_mode(site_dir(models, info.site))[0] == MODE_LIVE
+        except (ValueError, OSError):
+            was_live = False
+        write_mode(working, MODE_SHADOW, model.trained_at, was_live)
         _publish(models, info.site)
     except NotTrainable as exc:
         # The trainer refuses a dataset build_dataset accepted when its labels outgrow the head.

@@ -1,6 +1,13 @@
 import pytest
 
-from stuntd.decisions.schema import MAX_FIELDS, DecisionSchema, MultiFieldSchema, detect_schema
+from stuntd.decisions.schema import (
+    MAX_FIELDS,
+    DecisionSchema,
+    MultiFieldSchema,
+    declares_message_schema,
+    declares_schema,
+    detect_schema,
+)
 
 
 def chat(**extra):
@@ -322,3 +329,38 @@ def test_field_canonical_is_a_single_field_schema():
 
 def test_single_field_stays_a_decision_schema():
     assert isinstance(detect_schema(form(typed_properties(1))), DecisionSchema)
+
+
+def test_chat_request_with_a_json_schema_declares_a_schema():
+    assert declares_schema(form({"a": {"type": "string"}}))
+
+
+def test_chat_request_with_one_function_tool_declares_a_schema():
+    tool = {"type": "function", "function": {"name": "note", "parameters": {"type": "object"}}}
+    assert declares_schema(chat(tools=[tool]))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {},
+        {"response_format": {"type": "json_object"}},
+        {"tools": []},
+        {"tools": [{"type": "function", "function": {"name": "a"}}] * 2},
+    ],
+    ids=["plain", "json-object", "no-tools", "two-tools"],
+)
+def test_chat_request_without_one_schema_declares_none(extra):
+    assert not declares_schema(chat(**extra))
+
+
+def test_message_request_with_an_output_schema_declares_a_schema():
+    assert declares_message_schema({"output_config": {"format": {"type": "json_schema"}}})
+
+
+def test_message_request_with_one_named_tool_declares_a_schema():
+    assert declares_message_schema({"tools": [{"name": "note", "input_schema": {}}]})
+
+
+def test_message_request_without_one_schema_declares_none():
+    assert not declares_message_schema({"messages": [], "tools": [{"name": "a"}, {"name": "b"}]})

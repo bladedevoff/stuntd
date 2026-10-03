@@ -2,25 +2,28 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from stuntd.paths import private_dir, write_private
-from stuntd.train.metrics import ClassStats, ConfidentError, Operating
+from stuntd.train.metrics import ClassStats, ConfidentError, Interval, Operating
 
 __all__ = [
+    "EMBEDDINGS_FILE",
     "HEAD_FILE",
     "META_FILE",
     "SiteModel",
     "list_models",
     "load_model",
+    "rename_model",
     "save_model",
     "site_dir",
     "write_meta",
 ]
 
 HEAD_FILE = "head.safetensors"
+EMBEDDINGS_FILE = "embeddings.safetensors"
 META_FILE = "meta.json"
 
 _SITE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -52,6 +55,11 @@ class SiteModel:
     max_len: int | None = None
     head_max_len: int | None = None
     spaced_labels: bool = False
+    agreement_interval: Interval | None = None
+    covered_interval: Interval | None = None
+    n_covered: int | None = None
+    novelty_cutoff: float | None = None
+    familiar_share: float | None = None
 
 
 def site_dir(models: Path, site: str) -> Path:
@@ -79,6 +87,10 @@ def save_model(models: Path, model: SiteModel) -> Path:
     return folder
 
 
+def _interval(raw: dict[str, float] | None) -> Interval | None:
+    return None if raw is None else Interval(**raw)
+
+
 def _from_dict(raw: dict[str, Any]) -> SiteModel:
     # Any because json.loads returns untyped values; the fields below give them their types back.
     return SiteModel(
@@ -103,6 +115,11 @@ def _from_dict(raw: dict[str, Any]) -> SiteModel:
         max_len=raw.get("max_len"),
         head_max_len=raw.get("head_max_len"),
         spaced_labels=raw.get("spaced_labels", False),
+        agreement_interval=_interval(raw.get("agreement_interval")),
+        covered_interval=_interval(raw.get("covered_interval")),
+        n_covered=raw.get("n_covered"),
+        novelty_cutoff=raw.get("novelty_cutoff"),
+        familiar_share=raw.get("familiar_share"),
     )
 
 
@@ -114,6 +131,14 @@ def load_model(models: Path, site: str) -> SiteModel:
         return _from_dict(json.loads(text))
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise ValueError(f"{path}: {exc}") from exc
+
+
+def rename_model(models: Path, old: str, new: str) -> None:
+    """Moves a site's model folder to a new site name and rewrites the name in its metadata."""
+    target = site_dir(models, new)
+    site_dir(models, old).rename(target)
+    if (target / META_FILE).is_file():
+        write_meta(target, replace(load_model(models, new), site=new))
 
 
 def list_models(models: Path) -> list[SiteModel]:

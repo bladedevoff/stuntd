@@ -115,10 +115,10 @@ def test_an_unrelated_failure_is_not_swallowed(trainer_class):
     ids=["over the budget", "allocation failed"],
 )
 def test_cache_fallback_prints_one_line_on_stderr(trainer_class, capsys, budget, encode, line):
-    from stuntd.cli import _warnings_on_stderr
+    from stuntd.cli import _log_on_stderr
 
     trainer = stub(trainer_class, cache_max_bytes=budget, encode=encode)
-    with _warnings_on_stderr():
+    with _log_on_stderr():
         assert trainer._cache(SITE, rows(1, 3 * 2**19), []) == (None, None)
     assert capsys.readouterr().err == line
 
@@ -174,3 +174,71 @@ def test_physical_memory_is_unknown_when_windows_refuses(trainer_module, monkeyp
 
     monkeypatch.setattr(ctypes.windll.kernel32, "GlobalMemoryStatusEx", lambda status: 0)
     assert trainer_module._physical_memory() == 0
+
+
+def row_index_forward(trainer):
+    import torch
+
+    def forward(items):
+        weight = trainer._agent.model.head.weight
+        scores = weight * torch.ones(len(items), 3)
+        pooled = torch.tensor([[float(item), 0.5] for item in items])
+        return scores, torch.zeros(len(items), dtype=torch.long), pooled
+
+    return forward
+
+
+def fit_stub(trainer_class):
+    import torch
+
+    model = torch.nn.Module()
+    model.encoder = torch.nn.Linear(1, 1)
+    model.head = torch.nn.Linear(1, 1)
+    model.encoder.requires_grad_(False)
+    trainer = stub(trainer_class)
+    trainer._agent = types.SimpleNamespace(model=model, device=torch.device("cpu"))
+    trainer._seed, trainer._epochs, trainer._learning_rate, trainer._batch_size = 0, 2, 0.1, 4
+    trainer._forward_cached = row_index_forward(trainer)
+    return trainer
+
+
+def test_fit_returns_embeddings_in_dataset_order_after_shuffled_batches(trainer_class):
+    import torch
+
+    trainer = fit_stub(trainer_class)
+    embeddings = trainer._fit(SITE, [], list(range(10)), 3)
+    assert embeddings[:, 0].tolist() == [float(index) for index in range(10)]
+    assert embeddings.shape == torch.Size([10, 2])
+
+
+def test_logits_return_embeddings_in_holdout_order(trainer_class):
+    trainer = fit_stub(trainer_class)
+    values, embeddings = trainer._logits([], list(range(10)), 3)
+    assert len(values) == 10
+    assert embeddings[:, 0].tolist() == [float(index) for index in range(10)]
+
+
+def test_fit_logs_the_mean_loss_of_each_epoch(trainer_class, caplog):
+    import torch
+
+    model = torch.nn.Linear(2, 2)
+    model.encoder = torch.nn.Identity()
+    trainer = trainer_class.__new__(trainer_class)
+    trainer._epochs = 2
+    trainer._batch_size = 2
+    trainer._seed = 0
+    trainer._learning_rate = 1e-2
+    trainer._agent = types.SimpleNamespace(model=model, device=torch.device("cpu"))
+    trainer._forward_cached = lambda items: (
+        model(torch.stack(items)),
+        torch.zeros(len(items), dtype=torch.long),
+        torch.stack(items),
+    )
+    cache = [torch.ones(2), torch.zeros(2), torch.ones(2)]
+    with caplog.at_level("INFO", logger="stuntd.train.trainer"):
+        embeddings = trainer._fit(SITE, [], cache, 2)
+    assert embeddings.shape == (3, 2)
+    assert [record.getMessage().rsplit(" ", 1)[0] for record in caplog.records] == [
+        "banking77 epoch 1/2 loss",
+        "banking77 epoch 2/2 loss",
+    ]

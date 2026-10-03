@@ -14,6 +14,7 @@ __all__ = [
     "Question",
     "SystemOneRequest",
     "kind_for",
+    "laya_question",
     "parse_request",
     "typed_field",
 ]
@@ -68,6 +69,20 @@ def kind_for(question: Question) -> str:
     if kind is None:
         raise ValueError(f"unknown question type: {question.type!r}")
     return kind
+
+
+def laya_question(canonical: str) -> dict[str, object]:
+    """A canonical question as laya reads it."""
+    parsed = json.loads(canonical)
+    instructions = parsed["instructions"]
+    # laya reads instructions without a default, and a noul question may carry no criteria at all.
+    question: dict[str, object] = {
+        "type": parsed["type"],
+        "instructions": "" if instructions is None else instructions,
+    }
+    if parsed["criteria"] is not None:
+        question["criteria"] = parsed["criteria"]
+    return question
 
 
 def typed_field(site: str, canonical: str) -> tuple[str, str, tuple[str, ...]] | None:

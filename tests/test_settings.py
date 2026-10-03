@@ -1,4 +1,5 @@
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,11 @@ from stuntd.settings import (
     load_settings,
     models_path,
 )
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 
 def test_defaults_without_a_file(data_dir):
@@ -107,6 +113,13 @@ def test_malformed_toml_names_the_file(tmp_path):
         ({"auto_promote_after_hours": -1}, "auto_promote_after_hours must be at least 0, got -1"),
         ({"cache_size": -1}, "cache_size must be at least 0, got -1"),
         ({"auto_retrain": -1}, "auto_retrain cannot be negative, got -1"),
+        (
+            {"auto_retrain_min_minutes": -1},
+            "auto_retrain_min_minutes cannot be negative, got -1",
+        ),
+        ({"novelty_quantile": 0.0}, "novelty_quantile must be above 0 and at most 1, got 0.0"),
+        ({"novelty_quantile": 1.5}, "novelty_quantile must be above 0 and at most 1, got 1.5"),
+        ({"local_fallback": "base"}, "local_fallback must be one of zeroshot, head, got 'base'"),
     ],
     ids=[
         "port-zero",
@@ -126,11 +139,26 @@ def test_malformed_toml_names_the_file(tmp_path):
         "promote-hours",
         "cache-size",
         "auto-retrain",
+        "auto-retrain-wait",
+        "novelty-zero",
+        "novelty-over-one",
+        "local-fallback",
     ],
 )
 def test_out_of_range_values_are_rejected(override, message):
     with pytest.raises(ValueError, match=re.escape(message)):
         load_settings(None, {"upstream": "http://up", **override})
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [("", 30), ("auto_retrain_min_minutes = 0\n", 0), ("auto_retrain_min_minutes = 5\n", 5)],
+    ids=["default", "off", "custom"],
+)
+def test_automatic_retraining_wait_comes_from_the_file(tmp_path, line, expected):
+    cfg = tmp_path / "stuntd.toml"
+    cfg.write_text(f"[training]\n{line}", encoding="utf-8")
+    assert load_settings(cfg).auto_retrain_min_minutes == expected
 
 
 def test_database_path_uses_the_data_directory_unless_configured(tmp_path, data_dir):
@@ -168,11 +196,10 @@ def test_absolute_models_dir_is_kept(tmp_path, data_dir):
     assert load_settings(cfg).models_dir == target
 
 
-@pytest.mark.parametrize("key", ["holdout", "target_agreement"], ids=["holdout", "agreement"])
-def test_a_whole_number_share_is_rejected(tmp_path, key):
+def test_a_whole_number_holdout_is_out_of_range(tmp_path):
     cfg = tmp_path / "stuntd.toml"
-    cfg.write_text(f'upstream = "http://x"\n[training]\n{key} = 1\n', encoding="utf-8")
-    with pytest.raises(ValueError, match=re.escape(f"training.{key} must be float, got int")):
+    cfg.write_text('upstream = "http://x"\n[training]\nholdout = 1\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="holdout must be above 0 and at most 0.5, got 1.0"):
         load_settings(cfg)
 
 
@@ -266,6 +293,7 @@ def test_serving_section_is_read(tmp_path):
 
 def test_template_documents_serving():
     assert "[serving]" in CONFIG_TEMPLATE and "# check_share = 0.02" in CONFIG_TEMPLATE
+    assert '# local_fallback = "zeroshot"' in CONFIG_TEMPLATE
 
 
 def test_jev_section_is_read(tmp_path):
@@ -336,3 +364,59 @@ def test_jev_values_are_rejected(tmp_path, body, message):
 def test_template_documents_jev():
     assert "# learn = true" in CONFIG_TEMPLATE
     assert "[jev]" in CONFIG_TEMPLATE and '# model_name = "stuntd"' in CONFIG_TEMPLATE
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [("", 0.95), ("novelty_quantile = 0.9\n", 0.9), ("novelty_quantile = 1.0\n", 1.0)],
+    ids=["default", "custom", "maximum"],
+)
+def test_novelty_quantile_comes_from_the_file(tmp_path, line, expected):
+    cfg = tmp_path / "stuntd.toml"
+    cfg.write_text(f"[training]\n{line}", encoding="utf-8")
+    assert load_settings(cfg).novelty_quantile == expected
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [("", True), ("novelty_gate = false\n", False)],
+    ids=["on", "off"],
+)
+def test_novelty_gate_comes_from_the_file(tmp_path, line, expected):
+    cfg = tmp_path / "stuntd.toml"
+    cfg.write_text(f"[serving]\n{line}", encoding="utf-8")
+    assert load_settings(cfg).novelty_gate is expected
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [("", "zeroshot"), ('local_fallback = "head"\n', "head")],
+    ids=["default", "head"],
+)
+def test_local_fallback_comes_from_the_file(tmp_path, line, expected):
+    cfg = tmp_path / "stuntd.toml"
+    cfg.write_text(f"[serving]\n{line}", encoding="utf-8")
+    assert load_settings(cfg).local_fallback == expected
+
+
+def test_an_integer_target_agreement_is_accepted(tmp_path, data_dir):
+    cfg = tmp_path / "stuntd.toml"
+    cfg.write_text("[training]\ntarget_agreement = 1\n", encoding="utf-8")
+    settings = load_settings(cfg)
+    assert settings.target_agreement == 1.0
+    assert isinstance(settings.target_agreement, float)
+
+
+def test_a_boolean_is_not_a_float_setting(tmp_path, data_dir):
+    cfg = tmp_path / "stuntd.toml"
+    cfg.write_text("[training]\ntarget_agreement = true\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="training.target_agreement must be float"):
+        load_settings(cfg)
+
+
+def test_the_jev_extra_brings_the_typesafe_sdk():
+    pyproject = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text("utf-8"))
+    assert any(
+        requirement.startswith("typesafe-sdk")
+        for requirement in pyproject["project"]["optional-dependencies"]["jev"]
+    )

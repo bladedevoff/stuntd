@@ -39,6 +39,19 @@ def test_head_trains_on_a_local_checkpoint(tmp_path, trainer):
     assert (tmp_path / HEAD_FILE).stat().st_size > 0
 
 
+def test_training_stores_one_embedding_per_training_row(tmp_path, trainer):
+    from safetensors.torch import load_file
+
+    from stuntd.train.artifacts import EMBEDDINGS_FILE, HEAD_FILE
+
+    data = build_dataset("s", "boolean", BOOL, synthetic(), 10, 0.25)
+    trained = trainer(data, tmp_path / HEAD_FILE)
+    embeddings = load_file(str(tmp_path / EMBEDDINGS_FILE))["embeddings"]
+    assert embeddings.shape[0] == len(data.train)
+    assert trained.novelty is not None and len(trained.novelty) == len(data.holdout)
+    assert all(0.0 <= value <= 1.0 for value in trained.novelty)
+
+
 def test_head_resets_between_sites(tmp_path, trainer):
     from stuntd.train.artifacts import HEAD_FILE
 
@@ -73,3 +86,22 @@ def test_the_encoder_cache_agrees_with_the_uncached_path(tmp_path, laya_checkpoi
             keys.append(set(handle.keys()))
     assert abs(scores[0] - scores[1]) <= 0.05
     assert keys[0] == keys[1]
+
+
+def test_the_encoder_cache_leaves_the_stored_embeddings_unchanged(tmp_path, laya_checkpoint):
+    from safetensors.torch import load_file
+
+    from stuntd.train.artifacts import EMBEDDINGS_FILE, HEAD_FILE
+    from stuntd.train.trainer import LayaTrainer
+
+    data = build_dataset("s", "boolean", BOOL, synthetic(), 10, 0.25)
+    stored = []
+    for cached in (True, False):
+        folder = tmp_path / str(cached)
+        folder.mkdir()
+        trainer = LayaTrainer(
+            laya_checkpoint, device="cpu", epochs=2, batch_size=8, cache_encoder=cached
+        )
+        trainer(data, folder / HEAD_FILE)
+        stored.append(load_file(str(folder / EMBEDDINGS_FILE))["embeddings"].float())
+    assert stored[0].allclose(stored[1], atol=1e-2)

@@ -31,7 +31,7 @@ def write_config(data_dir, checkpoint):
         f'upstream = "{UPSTREAM}"\n'
         "[training]\nmin_examples = 10\nholdout = 0.25\n"
         f'base_model = "{checkpoint.replace(chr(92), "/")}"\ndevice = "cpu"\nepochs = 1\n'
-        "[serving]\ncheck_share = 0.0\n",
+        "[serving]\ncheck_share = 0.0\nnovelty_gate = false\n",
         encoding="utf-8",
     )
 

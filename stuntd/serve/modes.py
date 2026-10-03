@@ -16,6 +16,7 @@ __all__ = [
     "MODE_SHADOW",
     "SiteState",
     "read_mode",
+    "read_was_live",
     "site_state",
     "site_states",
     "write_mode",
@@ -35,6 +36,7 @@ class SiteState:
     mode: str
     model: SiteModel | None
     changed_at: float | None
+    was_live: bool = False
 
 
 def read_mode(folder: Path) -> tuple[str, float | None]:
@@ -59,18 +61,31 @@ def read_mode(folder: Path) -> tuple[str, float | None]:
     return mode, changed_at
 
 
-def write_mode(folder: Path, mode: str, now: float) -> None:
-    """Records the mode a site serves in, creating its folder when the site has none yet."""
+def read_was_live(folder: Path) -> bool:
+    """Whether the model in folder was published over a site that was serving live."""
+    path = folder / MODE_FILE
+    if not path.is_file():
+        return False
+    return json.loads(path.read_text(encoding="utf-8")).get("was_live") is True
+
+
+def write_mode(folder: Path, mode: str, now: float, was_live: bool = False) -> None:
+    """Records the mode a site serves in, creating its folder when the site has none yet;
+    was_live marks a model published over a site that was serving live."""
     if mode not in _MODES:
         raise ValueError(f"unknown mode {mode!r}")
-    text = json.dumps({"mode": mode, "changed_at": now}, allow_nan=False)
+    raw: dict[str, object] = {"mode": mode, "changed_at": now}
+    if was_live:
+        raw["was_live"] = True
+    text = json.dumps(raw, allow_nan=False)
     private_dir(folder)
     write_private(folder / MODE_FILE, text)
 
 
 def _state(models: Path, model: SiteModel) -> SiteState:
-    mode, changed_at = read_mode(site_dir(models, model.site))
-    return SiteState(model.site, mode, model, changed_at)
+    folder = site_dir(models, model.site)
+    mode, changed_at = read_mode(folder)
+    return SiteState(model.site, mode, model, changed_at, read_was_live(folder))
 
 
 def site_states(models: Path) -> list[SiteState]:

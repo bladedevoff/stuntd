@@ -40,6 +40,11 @@ def perfect_trainer(dataset, head_path):
     return TrainedHead(logits, LAYOUT)
 
 
+def flat_trainer(dataset, head_path):
+    head_path.write_bytes(b"head")
+    return TrainedHead([[0.0, 0.1] for _ in dataset.holdout], LAYOUT)
+
+
 def failing_trainer(dataset, head_path):
     raise RuntimeError("training failed: boom")
 
@@ -59,6 +64,39 @@ def test_trained_site_gets_a_model_and_the_thin_one_a_reason(store, data_dir):
     assert (
         results["thin"].model is None and "examples after deduplication" in results["thin"].reason
     )
+
+
+def test_trained_model_carries_intervals_and_the_rows_behind_the_operating_point(store):
+    model = train_sites(store, settings(), perfect_trainer, sites=["s1"])[0].model
+    assert model is not None and model.n_covered == 3
+    assert model.agreement_interval is not None and model.covered_interval is not None
+    assert model.agreement_interval.low < model.agreement < model.agreement_interval.high + 1e-9
+    assert model.covered_interval == model.agreement_interval
+
+
+def test_a_site_without_an_operating_point_has_no_covered_statistics(store):
+    model = train_sites(
+        store, Settings(min_examples=4, holdout=0.3, target_agreement=1.0), flat_trainer, ["s1"]
+    )[0].model
+    assert model is not None and model.threshold is None
+    assert (model.n_covered, model.covered_interval) == (None, None)
+
+
+def test_novelty_cutoff_is_the_configured_quantile_of_the_holdout_novelty(store):
+    def novel_trainer(dataset, head_path):
+        trained = perfect_trainer(dataset, head_path)
+        return TrainedHead(trained.logits, LAYOUT, [0.1, 0.2, 0.3])
+
+    model = train_sites(
+        store, Settings(min_examples=4, holdout=0.3, novelty_quantile=0.5), novel_trainer, ["s1"]
+    )[0].model
+    assert model is not None and model.novelty_cutoff == pytest.approx(0.2)
+    assert model.familiar_share == pytest.approx(2 / 3)
+
+
+def test_a_trainer_without_novelty_leaves_no_cutoff(store):
+    model = train_sites(store, settings(), perfect_trainer, sites=["s1"])[0].model
+    assert model is not None and (model.novelty_cutoff, model.familiar_share) == (None, None)
 
 
 def test_the_trainer_layout_is_written_into_the_metadata(store):
@@ -172,3 +210,25 @@ def test_retraining_resets_live_to_shadow(store):
     write_mode(models_path(settings()) / "s1", MODE_LIVE, now=1.0)
     train_sites(store, settings(), perfect_trainer, sites=["s1"])
     assert read_mode(models_path(settings()) / "s1")[0] == "shadow"
+
+
+def test_retraining_over_a_live_site_marks_it_was_live(store):
+    from stuntd.serve.modes import MODE_LIVE, read_was_live, write_mode
+
+    train_sites(store, settings(), perfect_trainer, sites=["s1"])
+    folder = models_path(settings()) / "s1"
+    assert not read_was_live(folder)
+    write_mode(folder, MODE_LIVE, now=1.0)
+    train_sites(store, settings(), perfect_trainer, sites=["s1"])
+    assert read_was_live(folder)
+    train_sites(store, settings(), perfect_trainer, sites=["s1"])
+    assert not read_was_live(folder)
+
+
+def test_retraining_replaces_unreadable_mode_file(store):
+    train_sites(store, settings(), perfect_trainer, sites=["s1"])
+    folder = models_path(settings()) / "s1"
+    (folder / "mode.json").write_text("not json", encoding="utf-8")
+    results = train_sites(store, settings(), perfect_trainer, sites=["s1"])
+    assert results[0].reason is None
+    assert json.loads((folder / "mode.json").read_text(encoding="utf-8"))["mode"] == "shadow"

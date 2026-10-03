@@ -16,8 +16,10 @@ from laya.common import QTYPES, build_sequence, collate_items
 from safetensors.torch import save_file
 from torch.nn.functional import cross_entropy
 
+from stuntd.train.artifacts import EMBEDDINGS_FILE
 from stuntd.train.dataset import Item, NotTrainable, SiteDataset
 from stuntd.train.layout import Layout, choose_layout, question_for
+from stuntd.train.novelty import novelty, pool_hidden, save_embeddings
 from stuntd.train.run import TrainedHead
 
 __all__ = ["LayaTrainer", "question_for", "site_row"]
@@ -41,7 +43,7 @@ _TORCH_ERRORS: tuple[type[Exception], ...] = (KeyError, OSError, RuntimeError, V
 # below are the untyped dicts its collate function consumes, and a batch is a list of either
 # those rows or the cached encoder output that stands in for them.
 _Row = dict[str, Any]
-_Forward = Callable[[list[Any]], tuple[torch.Tensor, torch.Tensor]]
+_Forward = Callable[[list[Any]], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
 _Item = TypeVar("_Item")
 
 _log = logging.getLogger(__name__)
@@ -125,7 +127,8 @@ def _head_forward(
     marker_mask: torch.Tensor,
     qtype: torch.Tensor,
 ) -> torch.Tensor:
-    # laya.common.DecisionModel.forward from the encoder on. Its act_head branch is left out:
+    # laya.common.DecisionModel.forward from the encoder on, shared by the cached and uncached
+    # paths, so neither goes through DecisionModel.forward. Its act_head branch is left out:
     # act_head is frozen, and stuntd reads the label logits and nothing else.
     hidden = hidden + model.type_emb(qtype)[:, None, :]
     if model.head is not None:
@@ -202,12 +205,14 @@ class LayaTrainer:
             layout = self._layout(dataset)
             train, holdout = self._items(dataset, layout)
             train_cache, holdout_cache = self._cache(dataset.site, train, holdout)
-            self._fit(train, train_cache, labels)
-            logits = self._logits(holdout, holdout_cache, labels)
+            reference = self._fit(dataset.site, train, train_cache, labels)
+            logits, queries = self._logits(holdout, holdout_cache, labels)
             _save_head(self._agent.model, head_path)
+            save_embeddings(reference, head_path.with_name(EMBEDDINGS_FILE))
+            distances = novelty(queries, reference).tolist()
         except _TORCH_ERRORS as exc:
             raise RuntimeError(f"training failed: {exc}") from exc
-        return TrainedHead(logits, layout)
+        return TrainedHead(logits, layout, distances)
 
     def _layout(self, dataset: SiteDataset) -> Layout:
         tok, cfg = self._agent.tok, self._agent.cfg
@@ -232,24 +237,30 @@ class LayaTrainer:
 
         return [row(item) for item in dataset.train], [row(item) for item in dataset.holdout]
 
-    def _forward(self, rows: list[_Row]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _forward(self, rows: list[_Row]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # laya's collate_items types its return as optional, but a non-empty batch never yields
         # None; the boundary is untyped, not the batch shape stuntd builds.
         batch = collate_items([rows], self._agent.tok.pad_token_id)
         device = self._agent.device
-        logits, _ = self._agent.model(
+        attention_mask = batch["attention_mask"].to(device)  # pyright: ignore[reportOptionalSubscript]
+        hidden = self._agent.model.encoder(
             input_ids=batch["input_ids"].to(device),  # pyright: ignore[reportOptionalSubscript]
-            attention_mask=batch["attention_mask"].to(device),  # pyright: ignore[reportOptionalSubscript]
-            marker_pos=batch["marker_pos"].to(device),  # pyright: ignore[reportOptionalSubscript]
-            marker_mask=batch["marker_mask"].to(device),  # pyright: ignore[reportOptionalSubscript]
-            qtype=batch["qtype"].to(device),  # pyright: ignore[reportOptionalSubscript]
-            detach_encoder=True,
+            attention_mask=attention_mask,
+        ).last_hidden_state.detach()
+        scores = _head_forward(
+            self._agent.model,
+            hidden,
+            attention_mask,
+            batch["marker_pos"].to(device),  # pyright: ignore[reportOptionalSubscript]
+            batch["marker_mask"].to(device),  # pyright: ignore[reportOptionalSubscript]
+            batch["qtype"].to(device),  # pyright: ignore[reportOptionalSubscript]
         )
-        scores: torch.Tensor = logits
         targets: torch.Tensor = batch["label"].to(device)  # pyright: ignore[reportOptionalSubscript]
-        return scores, targets
+        return scores, targets, pool_hidden(hidden.float(), attention_mask)
 
-    def _forward_cached(self, items: list[_Encoded]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _forward_cached(
+        self, items: list[_Encoded]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = self._agent.device
         width = max(item.hidden.shape[0] for item in items)
         markers = max(len(item.markers) for item in items)
@@ -263,15 +274,18 @@ class LayaTrainer:
             attention_mask[index, :length] = 1
             marker_pos[index, :kept] = torch.tensor(item.markers)
             marker_mask[index, :kept] = True
+        hidden = hidden.to(device).float()
+        attention_mask = attention_mask.to(device)
         scores = _head_forward(
             self._agent.model,
-            hidden.to(device).float(),
-            attention_mask.to(device),
+            hidden,
+            attention_mask,
             marker_pos.to(device),
             marker_mask.to(device),
             torch.tensor([item.qtype for item in items]).to(device),
         )
-        return scores, torch.tensor([item.label for item in items]).to(device)
+        targets = torch.tensor([item.label for item in items]).to(device)
+        return scores, targets, pool_hidden(hidden, attention_mask)
 
     def _encode(self, rows: list[_Row]) -> list[_Encoded]:
         model = self._agent.model
@@ -337,7 +351,9 @@ class LayaTrainer:
         scope: AbstractContextManager[Any] = torch.autocast("cuda", dtype=self._agent.dtype)
         return scope
 
-    def _fit(self, rows: list[_Row], cache: list[_Encoded] | None, labels: int) -> None:
+    def _fit(
+        self, site: str, rows: list[_Row], cache: list[_Encoded] | None, labels: int
+    ) -> torch.Tensor:
         torch.manual_seed(self._seed)
         model = self._agent.model
         model.train()
@@ -348,25 +364,39 @@ class LayaTrainer:
         optimizer = torch.optim.AdamW(trainable, lr=self._learning_rate)
         items: list[Any] = rows if cache is None else cache
         forward: _Forward = self._forward if cache is None else self._forward_cached
-        for _ in range(self._epochs):
+        embeddings: dict[int, torch.Tensor] = {}
+        for epoch in range(1, self._epochs + 1):
             order = torch.randperm(len(items)).tolist()
-            for chunk in _chunks([items[index] for index in order], self._batch_size):
+            losses: list[torch.Tensor] = []
+            for indices in _chunks(order, self._batch_size):
                 optimizer.zero_grad()
                 with self._autocast():
-                    scores, targets = forward(chunk)
+                    scores, targets, pooled = forward([items[index] for index in indices])
                     loss = cross_entropy(scores[:, :labels], targets)
                 torch.autograd.backward(loss)
                 optimizer.step()
+                losses.append(loss.detach())
+                embeddings.update(zip(indices, pooled.detach().cpu(), strict=True))
+            _log.info(
+                "%s epoch %d/%d loss %.4f",
+                site,
+                epoch,
+                self._epochs,
+                torch.stack(losses).mean().item(),
+            )
+        return torch.stack([embeddings[index] for index in range(len(items))])
 
     def _logits(
         self, rows: list[_Row], cache: list[_Encoded] | None, labels: int
-    ) -> list[list[float]]:
+    ) -> tuple[list[list[float]], torch.Tensor]:
         self._agent.model.eval()
         items: list[Any] = rows if cache is None else cache
         forward: _Forward = self._forward if cache is None else self._forward_cached
         values: list[list[float]] = []
+        embeddings: list[torch.Tensor] = []
         with torch.no_grad():
             for chunk in _chunks(items, self._batch_size):
-                scores, _ = forward(chunk)
+                scores, _, pooled = forward(chunk)
                 values.extend(scores[:, :labels].float().cpu().tolist())
-        return values
+                embeddings.append(pooled.cpu())
+        return values, torch.cat(embeddings)

@@ -28,7 +28,7 @@ Three ways to run it:
 - **In front of the paid Jev API.** stuntd relays, learns from the provider's own answers, and
   takes the decision over once its head is right often enough.
 
-Status: early release, v0.1. Every number below traces to a demo in this repository or to a source
+Status: early release, v0.1.3. Every number below traces to a demo in this repository or to a source
 listed at the end.
 
 ## Who it is for
@@ -49,19 +49,22 @@ listed at the end.
 ## Quickstart: local Jev without an API key
 
 ```
-pip install "stuntd[train]"
+pip install "stuntd[train,jev]"
 stuntd config init
 stuntd serve
 ```
 
 `config init` writes a commented `stuntd.toml` with everything at its default, which means no
-OpenAI upstream and no Jev provider. `serve` says so and loads the base checkpoint:
+OpenAI upstream and no Jev provider. `serve` lists the endpoints it serves and loads the base checkpoint:
 
 ```
 stuntd listening on http://127.0.0.1:8787
-no upstream: only the Jev routes are served
+endpoints: jev local
 serving jev locally with convaiinnovations/laya
 ```
+
+`stuntd stop` ends the daemon, and `GET /healthz` answers 200 with the number of sites in each
+mode without loading a checkpoint.
 
 Then change the base URL in your client and nothing else:
 
@@ -90,7 +93,41 @@ the browser and game agents built on the same SDK.
 
 The key is ignored unless you set `[jev] require_key = true`. To train a head on this daemon you
 need labelled rows: either put the paid Jev API in front of it (`[jev] upstream`) and let it teach,
-or write the rows yourself and `stuntd import` them.
+or write the rows yourself and `stuntd import` them (see
+[importing your own rows](#importing-your-own-rows)).
+
+### Try it without any key
+
+Nothing here needs an account, a provider or a training run: `pip install "stuntd[train,jev]"`,
+`stuntd serve`, and run the client above. The first start downloads the Laya checkpoint (see
+[Details worth knowing](#details-worth-knowing)).
+
+To see how each answer was served, post the questions yourself and read the `X-Stuntd` header:
+
+```
+curl -si http://127.0.0.1:8787/v1/systemone -H "content-type: application/json" -d '{
+  "state": "Charged twice for the same invoice",
+  "model": "jev-latest",
+  "questions": {"needs_human": {"type": "noul", "instructions": "Does a person have to read this?"}}
+}'
+```
+
+With no head trained, the header reads `X-Stuntd: jev; mode=local; questions=1; live=0;
+zeroshot=1`: the base checkpoint answered. The demos under [`examples/`](examples/) generate their
+own labelled rows, so `stuntd import`, `stuntd train` and `stuntd enable` can be tried on data with
+a known right answer before any of your own traffic is involved.
+
+### The local fallback
+
+In local Jev mode nothing sits behind the daemon, so a question a head will not answer has to be
+answered by something. By default that is the base Laya, zero-shot: the head answers when its
+confidence reaches the site's threshold and the request is not flagged by
+[the novelty gate](#the-novelty-gate), and the base checkpoint answers the rest.
+`serving.local_fallback = "head"` makes the head answer those too, for a head you trust more than
+zero-shot on your labels. `stuntd enable` warns when a site's coverage is under 50% in local mode
+with the zero-shot fallback, since most answers would then come from the base checkpoint.
+`stuntd report SITE --gold FILE` scores what is actually served under whichever fallback is set,
+and prints which one it used.
 
 ## Quickstart: OpenAI-compatible proxy that learns
 
@@ -129,6 +166,11 @@ stuntd report                  # holdout agreement, ECE, the operating point
 stuntd enable <site>           # let that site answer locally
 ```
 
+`enable` and `disable` also take the parent of a multi-field decision: `stuntd enable triage` acts
+on every `triage.<field>` that has a head and prints each one. While some fields are not live, the
+live ones are still compared against the provider's answer on every request, so their agreement
+keeps moving and a field that drifts is demoted on its own.
+
 ## Quickstart: in front of Anthropic
 
 ```
@@ -164,7 +206,7 @@ from the base checkpoint alone.
 | demo | questions | zero-shot | trained heads | answered locally | p50 per request |
 | --- | --- | --- | --- | --- | --- |
 | [Snake](examples/snake/) | 1 choice | 0.70 average score | 11.40 average score | 99.6% | 21.1 ms |
-| [support](examples/support/) | choice, score, noul | 69.5 / 34.5 / 66.5% | 99.5 / 85.5 / 97.5% | 90% | 90.3 ms |
+| [support](examples/support/) | choice, score, noul | 69.5 / 34.5 / 69.5% | 99.5 / 84.0 / 95.0% | 91% | 82.8 ms |
 | [banking](examples/banking/) | 2 choice | 89.5 / 30.0% | 100.0 / 72.5% | 78% | 75.7 ms |
 | [devtools](examples/devtools/) | choice, noul | 45.0 / 84.5% | 97.0 / 100.0% | 98% | 58.0 ms |
 
@@ -179,7 +221,7 @@ Snake is scored by what the answers do rather than by how many of them are right
 
 Five of the seven sites in the three text demos reach a holdout agreement of 0.95 or better. The
 demos run at the default `target_agreement` of 0.99, which picks each head's operating point rather
-than being a score it reached. The two that fall short, support's `urgency` at 0.935 and banking's
+than being a score it reached. The two that fall short, support's `urgency` at 0.922 and banking's
 `risk` at 0.937, stay in the demos anyway: see [limitations](#limitations).
 
 Latency, size and cost:
@@ -193,7 +235,7 @@ Latency, size and cost:
 | Jev API round trip, through OpenRouter | p50 376 to 389 ms |
 | Jev price | $0.042 per 1M input tokens, output free |
 | training one head: 5890 rows, 24 epochs | 186 s |
-| training three heads: 3000 rows each, 24 epochs | 362 s |
+| training three heads: 3000 rows each, 24 epochs | 266 s |
 | a trained head on disk | about 50 MB, fp16 |
 
 The first four rows were measured during development on an RTX 5060 laptop running Windows. They
@@ -265,11 +307,14 @@ Each site walks through four modes.
    is manual unless you set `serving.auto_promote`.
 
 With `serving.auto_promote` and `training.auto_retrain` both set, the loop closes: collect, train,
-shadow, promote, demote, and retrain once `auto_retrain` new captures have arrived since the head
-was trained. The daemon runs `stuntd train` for the site as a child process, one at a time, and
-the new head starts in shadow like any other. A failed run is logged with its exit code and is not
-retried until another `auto_retrain` captures arrive; serving carries on meanwhile. `stuntd status`
-shows how the last automatic run ended.
+shadow, promote, demote, and retrain once `auto_retrain` new distinct texts have arrived since the
+head was trained. A text recorded again does not count twice, and no run for a site starts sooner
+than `training.auto_retrain_min_minutes` (30 by default) after the previous one for that site. The
+daemon runs `stuntd train` for the site as a child process, one at a time, and the new head starts
+in shadow like any other, even when the site was live before: the daemon logs that at warning
+level and `stuntd status` shows `shadow (retrained, was live)`. A failed run is logged with its
+exit code and is not retried until another `auto_retrain` distinct texts arrive; serving carries
+on meanwhile. `stuntd status` shows how the last automatic run ended.
 
 In proxy mode the provider behind `[jev] upstream` does not have to be the paid API. Any server
 that speaks `POST /v1/systemone` can sit there -- kev, LLM2Jev, the laya-server family -- which
@@ -307,6 +352,131 @@ once the site is live: the head at or above the threshold, the teacher below it.
 is not one of the site's labels are skipped. `--json` prints the same numbers, and the command needs the train
 extra, since it loads the base model.
 
+### Reading `stuntd report`
+
+```
+site tickets  choice category  trained <time>  base convaiinnovations/laya
+examples: <n> train, <n> holdout
+holdout agreement 0.990 (95% interval <low>-<high>, <n> rows)  ece 0.011  temperature <t>
+novelty cut-off <cut-off>, lets <share> of the holdout through
+at threshold <t>: coverage <c>, agreement <a> (95% interval <low>-<high>, <n> rows)
+```
+
+Holdout agreement and the agreement at the operating point carry a 95% Wilson interval and the
+number of rows they rest on. A holdout under 200 rows, or an operating point resting on fewer than
+100 rows, prints a warning: the interval is then wide and the threshold may not hold on new
+traffic.
+
+Under the per-class table, "surest mistakes" lists the holdout rows the head got wrong with the
+highest confidence. Each shows the confidence and the probability the head gave the answer it
+chose, and is marked `(under the threshold)` when the head would not have served it. **Confidence
+is not a probability.** It is 1 minus the normalised entropy of the head's distribution, a measure
+of how peaked that distribution is, so the probability next to it, the head's own number for the
+label it gave, can be lower.
+
+### The novelty gate
+
+A head is sure about what it has seen. Its confidence threshold comes from a holdout of the same
+traffic, so it says nothing about a kind of request the head never saw: the support heads answered
+"what's the weather in Paris" at confidence 1.00.
+
+The gate checks the request before the confidence. Training stores the pooled, normalised encoder
+vector of every training row next to the head (`embeddings.safetensors`, 4.9 MB for the 2,400
+training rows of a 3,000-row site) and the holdout's novelty at `training.novelty_quantile` as
+`novelty_cutoff` in `meta.json`.
+Novelty is 1 minus the mean cosine similarity to the 5 nearest training vectors. A request whose
+novelty is above its site's cut-off is treated like a request under the confidence threshold: it
+goes to the provider, is recorded as a capture, and the header says `reason=novel`. In local Jev
+mode it follows [the local fallback](#the-local-fallback). `stuntd report` prints the cut-off and
+the share of the holdout it lets through. Heads trained before 0.1.3 have no stored vectors and
+serve as they did.
+
+It ships on: `serving.novelty_gate = true` and `training.novelty_quantile = 0.95`. Measured on the
+support demo ([`examples/support/`](examples/support/)):
+
+- **Unseen kinds of ticket.** One template per category held out, the heads trained on 3,000 rows
+  from the other 15 templates, 1,000 held-out tickets: the gate stopped 100% (1000/1000). Without
+  it all three heads were sure on 40.0% of them, and all three right on 61.0% of those.
+- **Unseen states of known templates.** The same heads, 1,000 unseen states of the 15 trained
+  templates (seed 10001): 76.6% answered locally without the gate, 70.6% with it, so 6.0 points go
+  to the provider. All three right when answered locally: 97.4% without, 97.7% with.
+- **Heads trained on all 20 templates.** Unseen states: 72.3% local without the gate, 66.9% with
+  it (5.4 points). The gate stopped 8.1% of these.
+- **Out-of-scope probes.** "what's the weather in Paris", `asdf qwer zxcv` and an empty state `{}`
+  were stopped on all three heads. Without the gate the heads answered the weather probe at
+  confidence 1.00. The category novelty of the probes was 0.197, 0.05 and 0.057 against a cut-off
+  of 0.007.
+
+The cost is larger than the 5% a single head's cut-off suggests because each field gates on its
+own, and a request with several fields goes to the provider if any field flags it. The release
+aimed for a drop of at most 5 points in local share on familiar requests; the 15-template
+measurement missed that by about one point, and the gate ships on anyway. To get more local
+answers, raise `training.novelty_quantile` (it is read when a head is trained, so retrain) or set
+`serving.novelty_gate = false`. The second lets unseen kinds of input through to the heads again.
+
+### Importing your own rows
+
+`stuntd import SITE FILE` reads JSONL, one `{"text": ..., "answer": ...}` per line, and records
+each row as a capture. The text has to be spelled the way the site will see its input when it
+serves. For a Jev site that is the serialised state, as stuntd serialises it: a string state is
+used as it is, and any other state is `json.dumps(state, ensure_ascii=False)`, with the keys in the
+order the client sends them and the default separators.
+
+```python
+import json
+
+state = {"subject": "Charged twice", "body": "Two charges on Friday."}
+row = {"text": json.dumps(state, ensure_ascii=False), "answer": "billing"}
+print(json.dumps(row, ensure_ascii=False))
+```
+
+For a chat site the text is the `user: ...` lines the store holds. The answer is always a string:
+a label for a `choice` site (`--labels a,b,c`), `true` or `false` with `--kind boolean`, a number
+for a number site. A `score` question is imported as a choice over its levels, so a 4-level score
+takes `--labels 0,1,2,3`. A malformed row stops the import and nothing is written.
+
+A row whose text and answer are already recorded for the site is skipped, and the command says how
+many it skipped, so importing the same file twice is safe. `--dry-run` prints what would be
+imported and skipped, and writes nothing.
+
+### Removing and renaming sites
+
+```
+stuntd status                  # field sites are listed under their parent
+stuntd site rename OLD NEW     # captures, decisions, model folder, plus an alias
+stuntd site rm SITE            # asks first; --yes skips the question
+```
+
+`rename` moves a site's captures, decisions and model folder (the field sites of a multi-field
+parent move with it) and records an alias, so requests whose computed site key is OLD keep landing
+on NEW. `rm` deletes the same things and refuses while the site is live unless you pass `--force`.
+Default site keys have not changed, so stores and heads from earlier versions keep working.
+
+### `/healthz` and `stuntd stop`
+
+`GET /healthz` answers 200 with `{"status": "ok", "learning": ..., "sites": {mode: count}}`
+without loading a checkpoint, which makes it usable as a container health check. `stuntd serve`
+writes a pid file under the data directory and `stuntd stop` ends that daemon; it exits 1 and says
+so when none is running. `stuntd train` prints one line per epoch to stderr while it works.
+
+### How many rows and how many epochs
+
+These are the only measurements behind the advice: the demos in this repository, on one laptop,
+with one encoder and rule-written teachers. Take them as a starting point.
+
+- **Rows.** `training.min_examples` is 300, enough to train something and not enough to trust it;
+  `report` warns under 200 holdout rows. The demos use 3,000 rows per site. On the hardest site of
+  each, 1,500 rows at 24 epochs scored 0.643 (support `urgency`), 0.840 (banking `risk`) and 0.863
+  (devtools `command_gate`); 3,000 rows scored 0.922, 0.937 and 0.985.
+- **Epochs.** The default is 3, which is too few for anything but an easy site. At 1,500 rows
+  `urgency` scored 0.323 at 3 epochs, 0.510 at 12 and 0.643 at 24; `risk` 0.367, 0.693 and 0.840;
+  `command_gate` 0.473, 0.717 and 0.863. The demos set `training.epochs = 24`. With the encoder
+  cache on, the default, the extra epochs cost seconds, because the frozen encoder runs once per
+  site: three support sites at 3,000 rows and 24 epochs took 266 s.
+- **Checking.** `stuntd report` gives the holdout agreement with its interval; prefer a site whose
+  interval clears your target to one whose point estimate does. `stuntd report SITE --gold FILE`
+  says whether the teacher itself was right.
+
 ### The `X-Stuntd` header
 
 Every answer says how it was served, so a silent fallback cannot hide.
@@ -324,7 +494,7 @@ X-Stuntd: passthrough; reason=no-schema
 | mode | `live`, `shadow`, `collect`, `passthrough` |
 | `site=` | the decision site this request landed on |
 | `confidence=` | the head's calibrated confidence, two decimals, on a live answer |
-| `reason=` | `no-schema`, `streaming`, `learning-off`, `no-upstream`, `low-confidence`, `check`, `retrained`, `model-error`, `no-runtime`, `state-error`, `upstream-error`; on a multi-field request `low-confidence:<field>` and `not-live:<field>` name the field that kept it from being local |
+| `reason=` | `no-schema`, `unsupported-schema`, `streaming`, `learning-off`, `no-upstream`, `low-confidence`, `novel`, `check`, `retrained`, `model-error`, `no-runtime`, `state-error`, `upstream-error`; on a multi-field request `low-confidence:<field>`, `novel:<field>` and `not-live:<field>` name the field that kept it from being local |
 
 On the Jev path: the mode it served in, then how the questions were answered.
 
@@ -372,13 +542,17 @@ from. Every key is optional and a missing one keeps the default.
 | `training.cache_encoder` | `true` | Whether the frozen encoder runs once per example instead of once per epoch; off re-encodes. |
 | `training.cache_max_mb` | `0` | Most memory the cached encoder output may take, in megabytes; 0 is half of physical memory. A bigger site trains uncached and says so on stderr. |
 | `training.max_option_tokens` | `1024` | How far a site with many or long labels may widen the option budget, in tokens, so every label is shown whole; past it, labels are cut short. A value below the checkpoint's own budget (192) keeps the checkpoint's. |
-| `training.auto_retrain` | `0` | New captures a site needs after its head was trained before the daemon trains it again in the background; 0 leaves training to `stuntd train`. A site without a head first needs `min_examples`. |
+| `training.auto_retrain` | `0` | New distinct texts a site needs after its head was trained before the daemon trains it again in the background; 0 leaves training to `stuntd train`. A site without a head first needs `min_examples`. |
+| `training.auto_retrain_min_minutes` | `30` | Minutes a site waits after one automatic run before the daemon may start the next; 0 is no wait. |
+| `training.novelty_quantile` | `0.95` | Quantile of the holdout's novelty used as a head's cut-off, read when the head is trained. Higher lets more requests through. |
 | `serving.check_share` | `0.02` | Share of live requests still sent to the provider to check the head. Inert in local Jev mode. |
 | `serving.window` | `100` | Recent decisions a site is judged on. |
 | `serving.min_window` | `20` | Decisions needed before that judgement counts. |
 | `serving.auto_promote` | `false` | Whether a shadow site that holds its target goes live on its own. |
 | `serving.auto_promote_after_hours` | `24` | Hours in shadow before it may. |
 | `serving.cache_size` | `1000` | Answers kept in memory, one LRU cache shared by every site. |
+| `serving.novelty_gate` | `true` | Whether a request unlike every row a head was trained on goes to the provider, or to the local fallback, instead of the head. Heads trained before 0.1.3 are not gated. |
+| `serving.local_fallback` | `"zeroshot"` | What a local Jev answers with when a head is unsure or the request is novel: `"zeroshot"`, the base checkpoint, or `"head"`, the head anyway. |
 | `serving.lazy_load` | `false` | Whether the base checkpoint loads on the first request instead of at startup. A failed load answers that request from the provider and is retried on the next one. `stuntd serve --lazy` sets it. |
 | `jev.upstream` | `""` | Origin of the paid Jev provider, no path. Empty: the base Laya answers locally. |
 | `jev.require_key` | `false` | Whether a Jev request must carry a Bearer token. The token itself is not checked. |
@@ -427,11 +601,29 @@ coverage 0.57. If your decision is really a calculation, write the calculation, 
   prose, a summary or code is relayed and never recorded.
 - **A site needs examples.** `training.min_examples` is 300 and the demos use 3000 rows. A rare
   decision, or one whose option list changes every week, is not a fit.
+- **A multi-field request is only as local as its weakest field.** Every field gates on its own
+  and the provider answers the whole request if any one field is unsure, novel or not live, so
+  the local share of a request is lower than that of its best field.
+- **Local Jev falls back to zero-shot by default.** A question under a head's threshold, or
+  flagged as novel, is answered by the base checkpoint, which is what the head was distilled
+  from. On 77 labels that checkpoint scores 38.2 (see [Numbers](#numbers)). Set
+  `serving.local_fallback = "head"` to use the head instead, and measure either with
+  `report --gold`.
 - **Overlapping labels make a head defer.** The weakest site of the three text demos is the
   support demo's `urgency`, a four-level `score`. Its levels overlap in wording, so the head
-  reaches a 0.935 holdout agreement and answers 71% of the tickets at 99.1% agreement, handing the
-  other 29% to the provider. That is a working site rather than a failure, but it is the shape to
+  reaches a 0.922 holdout agreement and answers 73% of the tickets at 99.1% agreement, handing the
+  other 27% to the provider. That is a working site rather than a failure, but it is the shape to
   expect when the labels are not cleanly separated by words.
+- **A head is sure about what it has seen, not about what is new.** The threshold comes from a
+  holdout of the same traffic, so it holds for requests like the ones the head trained on and says
+  nothing about a kind of request it never saw. In the support demo, with one ticket template per
+  category left out of training, all three heads were sure on 40% of the new tickets and all three
+  right on 61% of those, against 97% on new tickets from known templates. The
+  [novelty gate](#the-novelty-gate) stopped all of those tickets in the same test, and it costs
+  about 6 points of local share on requests like the training ones. It judges distance from the
+  training rows, not correctness: a request that looks familiar and is answered wrongly gets
+  through. On live traffic the `check_share` sample is what catches that: a site whose agreement
+  with the teacher falls goes back to shadow.
 - **OpenAI Chat Completions and Anthropic Messages learn.** The OpenAI Responses API and Gemini
   pass through untouched, and so does any streaming request. Codex CLI and Gemini CLI run through
   stuntd as if it were not there.
@@ -456,8 +648,9 @@ coverage 0.57. If your decision is really a calculation, write the calculation, 
 - **Local Jev mode compares nothing.** There is no second opinion to compare against, because the
   zero-shot answers come from the very checkpoint the head was distilled from. No request is
   sampled for a check, `stuntd status` reports `"agreement": null`, and no site is ever demoted.
-  `stuntd report`, which measures the head against held-out rows, is the quality signal there. Put
-  a Jev provider in front and both come back.
+  `stuntd report`, which measures the head against held-out rows, and `report --gold`, which
+  scores what is served against rows a person checked, are the quality signal there. Put a Jev
+  provider in front and the comparison comes back.
 - **One CUDA workload at a time.** Stop the daemon before `stuntd train`, or the two contend for
   the same GPU. The same holds for `training.auto_retrain`: the training run it starts shares the
   GPU with serving unless `training.device` is `cpu`.
@@ -529,6 +722,10 @@ Next: support for new formats.
 
 Later:
 
+- `stuntd eval` against baselines, so a head can be compared with zero-shot and a fine-tuned
+  encoder on your own rows.
+- CPU and ONNX serving, and a container image.
+- Multilingual checkpoints, and other encoders.
 - Encode the state once per request instead of once per question, for multi-question latency.
 - Option-order augmentation during training.
 - Dynamic candidate options, so a site whose option list changes does not need a new head.

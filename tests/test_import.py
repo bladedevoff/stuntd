@@ -250,3 +250,54 @@ def test_missing_file_is_reported(data_dir, tmp_path, capsys):
     assert main(["import", "spam", str(missing), "--kind", "boolean"]) == 2
     assert "stuntd:" in capsys.readouterr().err
     assert not (data_dir / "captures.sqlite").exists()
+
+
+def test_import_skips_rows_already_recorded(data_dir, tmp_path, capsys):
+    path = write_rows(tmp_path, [row("a", "true"), row("b", "false")])
+    assert main(["import", "spam", path, "--kind", "boolean"]) == 0
+    capsys.readouterr()
+    more = write_rows(tmp_path, [row("a", "true"), row("c", "true")], name="more.jsonl")
+    assert main(["import", "spam", more, "--kind", "boolean"]) == 0
+    assert "imported 1 rows into spam, skipped 1 already recorded" in capsys.readouterr().out
+    assert [captured[3] for captured in stored(data_dir)] == ["a", "b", "c"]
+
+
+def test_import_records_a_known_text_under_another_answer(data_dir, tmp_path, capsys):
+    assert (
+        main(["import", "spam", write_rows(tmp_path, [row("a", "true")]), "--kind", "boolean"]) == 0
+    )
+    other = write_rows(tmp_path, [row("a", "false")], name="other.jsonl")
+    assert main(["import", "spam", other, "--kind", "boolean"]) == 0
+    assert "imported 1 rows into spam, skipped 0 already recorded" in capsys.readouterr().out
+
+
+def test_import_skips_a_row_repeated_within_the_file(data_dir, tmp_path, capsys):
+    path = write_rows(tmp_path, [row("a", "true"), row("a", "true")])
+    assert main(["import", "spam", path, "--kind", "boolean"]) == 0
+    assert "imported 1 rows into spam, skipped 1 already recorded" in capsys.readouterr().out
+    assert len(stored(data_dir)) == 1
+
+
+def test_import_matches_rows_by_their_redacted_text(data_dir, tmp_path, capsys):
+    path = write_rows(tmp_path, [row("write to me@example.com", "true")])
+    assert main(["import", "spam", path, "--kind", "boolean"]) == 0
+    capsys.readouterr()
+    assert main(["import", "spam", path, "--kind", "boolean"]) == 0
+    assert "imported 0 rows into spam, skipped 1 already recorded" in capsys.readouterr().out
+
+
+def test_dry_run_counts_rows_and_writes_nothing(data_dir, tmp_path, capsys):
+    path = write_rows(tmp_path, [row("a", "true"), row("b", "false")])
+    assert main(["import", "spam", path, "--kind", "boolean"]) == 0
+    capsys.readouterr()
+    more = write_rows(tmp_path, [row("a", "true"), row("c", "true")], name="more.jsonl")
+    assert main(["import", "spam", more, "--kind", "boolean", "--dry-run"]) == 0
+    assert "would import 1 rows into spam, skip 1 already recorded" in capsys.readouterr().out
+    assert len(stored(data_dir)) == 2
+
+
+def test_dry_run_creates_no_database(data_dir, tmp_path, capsys):
+    path = spam_rows(tmp_path)
+    assert main(["import", "spam", path, "--kind", "boolean", "--dry-run"]) == 0
+    assert "would import 10 rows into spam, skip 0 already recorded" in capsys.readouterr().out
+    assert not (data_dir / "captures.sqlite").exists()

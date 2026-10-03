@@ -12,11 +12,12 @@ from stuntd.train.artifacts import (
     SiteModel,
     list_models,
     load_model,
+    rename_model,
     save_model,
     site_dir,
     write_meta,
 )
-from stuntd.train.metrics import ClassStats, ConfidentError, Operating
+from stuntd.train.metrics import ClassStats, ConfidentError, Interval, Operating
 
 
 def model(site="s1"):
@@ -41,8 +42,13 @@ def model(site="s1"):
             "block": ClassStats(20, 0.9),
             "x": ClassStats(0, None),
         },
-        confident_errors=[ConfidentError("user: hi", 1, 0, 0.97)],
+        confident_errors=[ConfidentError("user: hi", 1, 0, 0.97, 0.91)],
         curve=[Operating(0.9, 0.5, 1.0), Operating(0.62, 0.8, 0.99)],
+        agreement_interval=Interval(0.86, 0.98),
+        covered_interval=Interval(0.95, 1.0),
+        n_covered=48,
+        novelty_cutoff=0.31,
+        familiar_share=0.95,
     )
 
 
@@ -68,6 +74,36 @@ def test_metadata_without_a_layout_loads_as_the_checkpoint_one(tmp_path):
     loaded = load_model(tmp_path / "models", "s1")
     assert (loaded.max_len, loaded.head_max_len, loaded.spaced_labels) == (None, None, False)
     assert loaded == model()
+
+
+def test_metadata_without_statistics_loads_without_them(tmp_path):
+    raw = asdict(model())
+    for key in ("agreement_interval", "covered_interval", "n_covered"):
+        del raw[key]
+    del raw["confident_errors"][0]["probability"]
+    folder = tmp_path / "models" / "s1"
+    folder.mkdir(parents=True)
+    (folder / META_FILE).write_text(json.dumps(raw), encoding="utf-8")
+    loaded = load_model(tmp_path / "models", "s1")
+    assert (loaded.agreement_interval, loaded.covered_interval, loaded.n_covered) == (None,) * 3
+    assert loaded.confident_errors == [ConfidentError("user: hi", 1, 0, 0.97)]
+
+
+def test_metadata_without_a_familiar_share_loads_without_one(tmp_path):
+    folder = save_model(tmp_path / "models", model())
+    raw = json.loads((folder / META_FILE).read_text(encoding="utf-8"))
+    del raw["familiar_share"]
+    (folder / META_FILE).write_text(json.dumps(raw), encoding="utf-8")
+    assert load_model(tmp_path / "models", "s1").familiar_share is None
+
+
+def test_metadata_without_a_novelty_cutoff_loads_without_one(tmp_path):
+    raw = asdict(model())
+    del raw["novelty_cutoff"]
+    folder = tmp_path / "models" / "s1"
+    folder.mkdir(parents=True)
+    (folder / META_FILE).write_text(json.dumps(raw), encoding="utf-8")
+    assert load_model(tmp_path / "models", "s1").novelty_cutoff is None
 
 
 def test_list_models_is_sorted_and_tolerates_missing_dir(tmp_path):
@@ -153,3 +189,20 @@ def test_write_meta_produces_a_loadable_folder(tmp_path):
     raw = json.loads((tmp_path / "x" / META_FILE).read_text(encoding="utf-8"))
     assert raw == asdict(model("x"))
     assert load_model(tmp_path, "x") == model("x")
+
+
+def test_rename_model_moves_the_folder_and_rewrites_the_site(tmp_path):
+    models = tmp_path / "models"
+    folder = save_model(models, model("old"))
+    (folder / HEAD_FILE).write_bytes(b"h")
+    rename_model(models, "old", "new")
+    assert not folder.exists()
+    assert (models / "new" / HEAD_FILE).read_bytes() == b"h"
+    assert load_model(models, "new") == replace(model(), site="new")
+
+
+def test_rename_model_moves_a_folder_that_has_no_metadata(tmp_path):
+    models = tmp_path / "models"
+    (models / "old").mkdir(parents=True)
+    rename_model(models, "old", "new")
+    assert (models / "new").is_dir()

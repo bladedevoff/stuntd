@@ -12,9 +12,10 @@ import torch
 from laya.common import collate_items
 from safetensors.torch import load_file
 
-from stuntd.train.artifacts import SiteModel
+from stuntd.train.artifacts import EMBEDDINGS_FILE, SiteModel
 from stuntd.train.layout import Layout
 from stuntd.train.metrics import confidence, softmax
+from stuntd.train.novelty import novelty, pool_hidden
 from stuntd.train.trainer import site_row
 
 __all__ = ["HEAD_CACHE_SIZE", "Decider", "Verdict"]
@@ -44,14 +45,22 @@ _HeadKey = tuple[Path, int]
 
 
 @dataclass(frozen=True)
+class _Head:
+    weights: dict[str, torch.Tensor]
+    embeddings: torch.Tensor | None
+
+
+@dataclass(frozen=True)
 class Verdict:
     """One answer from a site's head: the label it chose, every label's probability, how sure it
-    is, and how long it took."""
+    is, how long it took, and how far the request is from the rows the head trained on, when the
+    head kept them."""
 
     label: int
     confidence: float
     latency_ms: int
     probabilities: tuple[float, ...]
+    novelty: float | None = None
 
 
 class Decider:
@@ -61,7 +70,8 @@ class Decider:
         self._base_model = base_model
         self._device = device
         self._agent: Any = None
-        self._heads: OrderedDict[_HeadKey, dict[str, torch.Tensor]] = OrderedDict()
+        self._heads: OrderedDict[_HeadKey, _Head] = OrderedDict()
+        self._embeddings: torch.Tensor | None = None
         self._resident: _HeadKey | Literal["base"] | None = None
         self._lock = threading.Lock()
         if not lazy:
@@ -79,13 +89,20 @@ class Decider:
             self._install(head_path)
             try:
                 started = time.perf_counter()
-                scores = self._scores(self._row(text, model))
+                scores, pooled = self._scores(self._row(text, model))
+                distance = None if self._embeddings is None else novelty(pooled, self._embeddings)
                 latency_ms = round((time.perf_counter() - started) * 1000)
             except _TORCH_ERRORS as exc:
                 raise RuntimeError(f"decision failed: {exc}") from exc
         probs = softmax(scores[: len(model.labels)], model.temperature)
         label = max(range(len(probs)), key=probs.__getitem__)
-        return Verdict(label, confidence(probs), latency_ms, tuple(probs))
+        return Verdict(
+            label,
+            confidence(probs),
+            latency_ms,
+            tuple(probs),
+            None if distance is None else float(distance[0]),
+        )
 
     def answer(self, state: object, questions: dict[str, dict[str, object]]) -> dict[str, object]:
         """Answers Jev questions zero-shot, with the checkpoint's own head rather than a site's.
@@ -139,7 +156,7 @@ class Decider:
             raise RuntimeError(f"base model failed to load: {exc}") from exc
         self._agent = agent
 
-    def _head(self, head_path: Path, key: _HeadKey) -> dict[str, torch.Tensor]:
+    def _head(self, head_path: Path, key: _HeadKey) -> _Head:
         cached = self._heads.get(key)
         if cached is not None:
             self._heads.move_to_end(key)
@@ -155,7 +172,10 @@ class Decider:
             )
         # The head is stored in float16 on the CPU; casting and moving it once keeps the pass at
         # one precision and keeps its weights off the bus on every later decision.
-        head = {name: tensor.to(self._agent.device, self._dtype) for name, tensor in saved.items()}
+        weights = {
+            name: tensor.to(self._agent.device, self._dtype) for name, tensor in saved.items()
+        }
+        head = _Head(weights, self._load_embeddings(head_path))
         # Retraining a site leaves its earlier head behind, and nothing will ever ask for it
         # again, so one path keeps one head rather than a version per training run.
         for stale in [known for known in self._heads if known[0] == head_path]:
@@ -166,6 +186,15 @@ class Decider:
         if len(self._heads) > HEAD_CACHE_SIZE:
             self._heads.popitem(last=False)
         return head
+
+    def _load_embeddings(self, head_path: Path) -> torch.Tensor | None:
+        path = head_path.with_name(EMBEDDINGS_FILE)
+        if not path.is_file():
+            return None
+        try:
+            return load_file(str(path))["embeddings"].to(self._agent.device, torch.float32)
+        except _TORCH_ERRORS as exc:
+            raise RuntimeError(f"decision failed: {exc}") from exc
 
     def _install(self, head_path: Path) -> None:
         try:
@@ -179,7 +208,7 @@ class Decider:
         head = self._head(head_path, key)
         self._resident = None
         try:
-            incompatible = self._agent.model.load_state_dict(head, strict=False)
+            incompatible = self._agent.model.load_state_dict(head.weights, strict=False)
         except _TORCH_ERRORS as exc:
             raise RuntimeError(f"decision failed: {exc}") from exc
         unexpected = sorted(incompatible.unexpected_keys)
@@ -191,6 +220,7 @@ class Decider:
                 f"head does not match the base model: unexpected {unexpected[:_SHOWN_KEYS]},"
                 f" missing {missing[:_SHOWN_KEYS]}"
             )
+        self._embeddings = head.embeddings
         self._resident = key
 
     def _install_base(self) -> None:
@@ -217,18 +247,28 @@ class Decider:
             raise ValueError(f"{len(model.labels)} labels do not fit the head budget")
         return row
 
-    def _scores(self, row: _Row) -> list[float]:
+    def _scores(self, row: _Row) -> tuple[list[float], torch.Tensor]:
         # laya's collate_items types its return as optional, but a one-row batch never yields
         # None; the boundary is untyped, not the batch shape stuntd builds.
         batch = collate_items([[row]], self._agent.tok.pad_token_id)
         device = self._agent.device
-        with torch.no_grad():
-            logits, _ = self._agent.model(
-                input_ids=batch["input_ids"].to(device),  # pyright: ignore[reportOptionalSubscript]
-                attention_mask=batch["attention_mask"].to(device),  # pyright: ignore[reportOptionalSubscript]
-                marker_pos=batch["marker_pos"].to(device),  # pyright: ignore[reportOptionalSubscript]
-                marker_mask=batch["marker_mask"].to(device),  # pyright: ignore[reportOptionalSubscript]
-                qtype=batch["qtype"].to(device),  # pyright: ignore[reportOptionalSubscript]
-            )
+        attention_mask = batch["attention_mask"].to(device)  # pyright: ignore[reportOptionalSubscript]
+        hidden: list[torch.Tensor] = []
+        # The model's forward runs the encoder itself, so its output is read off the call rather
+        # than computed a second time.
+        handle = self._agent.model.encoder.register_forward_hook(
+            lambda _module, _inputs, output: hidden.append(output.last_hidden_state)
+        )
+        try:
+            with torch.no_grad():
+                logits, _ = self._agent.model(
+                    input_ids=batch["input_ids"].to(device),  # pyright: ignore[reportOptionalSubscript]
+                    attention_mask=attention_mask,
+                    marker_pos=batch["marker_pos"].to(device),  # pyright: ignore[reportOptionalSubscript]
+                    marker_mask=batch["marker_mask"].to(device),  # pyright: ignore[reportOptionalSubscript]
+                    qtype=batch["qtype"].to(device),  # pyright: ignore[reportOptionalSubscript]
+                )
+        finally:
+            handle.remove()
         scores: list[float] = logits[0].float().cpu().tolist()
-        return scores
+        return scores, pool_hidden(hidden[0].float(), attention_mask)

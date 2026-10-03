@@ -109,6 +109,18 @@ def test_decider_agrees_with_the_trainer(trained):
     assert all(verdict.latency_ms >= 0 for verdict in verdicts)
 
 
+def test_decider_measures_how_far_a_request_is_from_the_training_rows(trained):
+    seen = trained.decider.decide(trained.model, trained.head, trained.dataset.train[0].text)
+    unseen = trained.decider.decide(trained.model, trained.head, "asdf qwer zxcv")
+    assert seen.novelty is not None and unseen.novelty is not None
+    assert 0.0 <= seen.novelty < unseen.novelty
+
+
+def test_decider_reports_no_novelty_for_a_head_without_embeddings(trained):
+    verdict = trained.decider.decide(trained.other_model, trained.other, "asdf qwer zxcv")
+    assert verdict.novelty is None
+
+
 def test_decider_reuses_a_cached_head(trained, monkeypatch):
     text = trained.dataset.holdout[0].text
     os.utime(trained.head)

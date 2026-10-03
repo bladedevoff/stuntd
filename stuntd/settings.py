@@ -4,7 +4,7 @@ import re
 import sys
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 from urllib.parse import urlsplit
 
 from stuntd.paths import data_dir
@@ -21,6 +21,7 @@ __all__ = [
     "database_path",
     "load_settings",
     "models_path",
+    "setting_key",
 ]
 
 CONFIG_TEMPLATE = """# stuntd settings. Every key is optional; a missing key keeps the default shown.
@@ -66,9 +67,14 @@ CONFIG_TEMPLATE = """# stuntd settings. Every key is optional; a missing key kee
 # How far the option budget may widen, in tokens, so a site's labels fit whole; past it, labels
 # are cut short. Below the checkpoint's own budget (192) it has no effect.
 # max_option_tokens = 1024
-# New captures a site needs after its model was trained before the daemon trains it again in the
-# background; 0 leaves training to `stuntd train`. A site without a model first needs min_examples.
+# New distinct texts a site needs after its model was trained before the daemon trains it again in
+# the background; 0 leaves training to `stuntd train`. A site without a model first needs
+# min_examples.
 # auto_retrain = 0
+# Minutes a site waits after one automatic run before the daemon may start the next; 0 is no wait.
+# auto_retrain_min_minutes = 30
+# Share of the holdout's novelty a head treats as familiar: its novelty cut-off is this quantile.
+# novelty_quantile = 0.95
 
 [serving]
 # Share of the requests a serving site still sends to the provider to check its own answer.
@@ -86,6 +92,11 @@ CONFIG_TEMPLATE = """# stuntd settings. Every key is optional; a missing key kee
 # Whether the base checkpoint loads on the first request instead of at startup; a failed load
 # answers that request from the provider and is retried on the next one.
 # lazy_load = false
+# Whether a request unlike any row a head was trained on goes to the provider instead of the head.
+# novelty_gate = true
+# What a local Jev answers with when a trained head is unsure or has not seen the like of a
+# request: "zeroshot", the base checkpoint, or "head", the head anyway.
+# local_fallback = "zeroshot"
 
 [jev]
 # Origin of the Jev provider answers are fetched from: the origin only, no path. Left empty, the
@@ -102,6 +113,7 @@ _DEFAULT_DB_NAME = "captures.sqlite"
 _DEFAULT_MODELS_NAME = "models"
 _MAX_PORT = 65535
 _DEVICES = ("auto", "cpu", "cuda", "mps")
+_LOCAL_FALLBACKS = ("zeroshot", "head")
 _ORIGIN_SCHEMES = ("http", "https")
 _MODEL_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
@@ -120,6 +132,8 @@ _SECTIONS = {
         "cache_max_mb": int,
         "max_option_tokens": int,
         "auto_retrain": int,
+        "auto_retrain_min_minutes": int,
+        "novelty_quantile": float,
     },
     "serving": {
         "check_share": float,
@@ -129,8 +143,18 @@ _SECTIONS = {
         "auto_promote_after_hours": int,
         "cache_size": int,
         "lazy_load": bool,
+        "novelty_gate": bool,
+        "local_fallback": str,
     },
     "jev": {"upstream": str, "require_key": bool, "model_name": str},
+}
+
+_FIELD_KEYS = {
+    "redact": "redaction.enabled",
+    "redaction_patterns": "redaction.patterns",
+    "jev_upstream": "jev.upstream",
+    "jev_require_key": "jev.require_key",
+    "jev_model_name": "jev.model_name",
 }
 
 _T = TypeVar("_T")
@@ -195,7 +219,13 @@ class Settings:
     """Most tokens the option budget may widen to; below the checkpoint's own it has no effect."""
 
     auto_retrain: int = 0
-    """New captures after which the daemon trains a site again in the background; 0 is off."""
+    """New distinct texts after which the daemon trains a site again in the background; 0 is off."""
+
+    auto_retrain_min_minutes: int = 30
+    """Minutes a site waits after one automatic run before the next may start; 0 is no wait."""
+
+    novelty_quantile: float = 0.95
+    """Quantile of the holdout's novelty that becomes a head's novelty cut-off."""
 
     check_share: float = 0.02
     """Share of the requests a serving site still sends to the provider to check its own answer,
@@ -218,6 +248,13 @@ class Settings:
 
     lazy_load: bool = False
     """Whether the base checkpoint loads on the first request instead of at startup."""
+
+    novelty_gate: bool = True
+    """Whether a request unlike any row a head was trained on goes to the provider."""
+
+    local_fallback: str = "zeroshot"
+    """What a local Jev answers with when a head is unsure or the request is novel: zeroshot, the
+    base checkpoint, or head, the head anyway."""
 
     learn: bool = True
     """Whether captures, models and decisions are written at all."""
@@ -278,8 +315,20 @@ def _check_jev_upstream(url: str) -> None:
         raise ValueError(message)
 
 
+def setting_key(field_name: str) -> str:
+    """The key a Settings field has in the settings file, such as training.epochs."""
+    if field_name in _FIELD_KEYS:
+        return _FIELD_KEYS[field_name]
+    if field_name in _TOP:
+        return field_name
+    section = next(name for name, keys in _SECTIONS.items() if field_name in keys)
+    return f"{section}.{field_name}"
+
+
 def _typed(where: str, value: object, expected: type[_T]) -> _T:
     # bool is an int subclass, so `port = true` would otherwise pass as an int.
+    if expected is float and isinstance(value, int) and not isinstance(value, bool):
+        return cast(_T, float(value))
     if isinstance(value, expected) and not (expected is int and isinstance(value, bool)):
         return value
     raise ValueError(f"{where} must be {expected.__name__}, got {type(value).__name__}")
@@ -337,6 +386,10 @@ def load_settings(path: Path | None = None, overrides: dict[str, Any] | None = N
         "training.max_option_tokens", settings.max_option_tokens
     )
     settings.auto_retrain = values.get("training.auto_retrain", settings.auto_retrain)
+    settings.auto_retrain_min_minutes = values.get(
+        "training.auto_retrain_min_minutes", settings.auto_retrain_min_minutes
+    )
+    settings.novelty_quantile = values.get("training.novelty_quantile", settings.novelty_quantile)
     settings.check_share = values.get("serving.check_share", settings.check_share)
     settings.window = values.get("serving.window", settings.window)
     settings.min_window = values.get("serving.min_window", settings.min_window)
@@ -346,6 +399,8 @@ def load_settings(path: Path | None = None, overrides: dict[str, Any] | None = N
     )
     settings.cache_size = values.get("serving.cache_size", settings.cache_size)
     settings.lazy_load = values.get("serving.lazy_load", settings.lazy_load)
+    settings.novelty_gate = values.get("serving.novelty_gate", settings.novelty_gate)
+    settings.local_fallback = values.get("serving.local_fallback", settings.local_fallback)
     settings.learn = values.get("learn", settings.learn)
     settings.jev_upstream = values.get("jev.upstream", settings.jev_upstream)
     settings.jev_require_key = values.get("jev.require_key", settings.jev_require_key)
@@ -381,6 +436,15 @@ def load_settings(path: Path | None = None, overrides: dict[str, Any] | None = N
         )
     if settings.auto_retrain < 0:
         raise ValueError(f"auto_retrain cannot be negative, got {settings.auto_retrain!r}")
+    if settings.auto_retrain_min_minutes < 0:
+        raise ValueError(
+            f"auto_retrain_min_minutes cannot be negative, "
+            f"got {settings.auto_retrain_min_minutes!r}"
+        )
+    if not 0 < settings.novelty_quantile <= 1:
+        raise ValueError(
+            f"novelty_quantile must be above 0 and at most 1, got {settings.novelty_quantile!r}"
+        )
     if settings.device not in _DEVICES:
         raise ValueError(f"device must be one of {', '.join(_DEVICES)}, got {settings.device!r}")
     if not 0 <= settings.check_share < 1:
@@ -400,6 +464,11 @@ def load_settings(path: Path | None = None, overrides: dict[str, Any] | None = N
         )
     if settings.cache_size < 0:
         raise ValueError(f"cache_size must be at least 0, got {settings.cache_size!r}")
+    if settings.local_fallback not in _LOCAL_FALLBACKS:
+        raise ValueError(
+            f"local_fallback must be one of {', '.join(_LOCAL_FALLBACKS)}, "
+            f"got {settings.local_fallback!r}"
+        )
     if settings.jev_upstream:
         _check_jev_upstream(settings.jev_upstream)
     if not _MODEL_NAME.fullmatch(settings.jev_model_name):

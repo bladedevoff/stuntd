@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,12 @@ from stuntd.train.artifacts import SiteModel, save_model
 from stuntd.train.gold import GoldRow, render_gold, score_gold
 
 LABELS = ["refund", "deny"]
+JEV_QUESTION = {
+    "criteria": {"deny": None, "refund": None},
+    "instructions": "Refund?",
+    "type": "choice",
+}
+JEV_CANONICAL = json.dumps(JEV_QUESTION, sort_keys=True, separators=(",", ":"))
 
 
 def site_model(threshold=0.8):
@@ -36,14 +43,28 @@ def site_model(threshold=0.8):
 
 
 class FakeDecider:
-    def __init__(self, verdicts):
+    def __init__(self, verdicts, zero_shot=None, novelty=None):
         self.verdicts = verdicts
+        self.zero_shot = zero_shot
+        self.novelty = novelty or {}
         self.asked = []
+        self.questions = []
 
     def decide(self, model, head_path, text):
         self.asked.append(text)
         label, confidence = self.verdicts[text]
-        return SimpleNamespace(label=LABELS.index(label), confidence=confidence)
+        return SimpleNamespace(
+            label=LABELS.index(label), confidence=confidence, novelty=self.novelty.get(text)
+        )
+
+    def answer(self, state, questions):
+        self.questions.append(questions)
+        return {
+            "answers": {
+                name: {"type": "choice", "choice": self.zero_shot[state]} for name in questions
+            },
+            "usage": {"input_tokens": 1, "output_tokens": 0},
+        }
 
 
 def row(text, answer):
@@ -56,10 +77,10 @@ def write_gold(tmp_path, lines):
     return str(path)
 
 
-def record(data_dir, *captures):
+def record(data_dir, *captures, schema="{}"):
     store = Store(data_dir / "captures.sqlite", Redactor())
     for text, answer in captures:
-        store.record(Capture("s1", "{}", "choice", text, answer, "gpt-x", 100, 1, 1))
+        store.record(Capture("s1", schema, "choice", text, answer, "gpt-x", 100, 1, 1))
     store.close()
 
 
@@ -75,7 +96,8 @@ def decider(monkeypatch):
             "user: a": ("deny", 0.9),
             "user: b": ("deny", 0.5),
             "user: mail [email]": ("refund", 0.95),
-        }
+        },
+        {"user: a": "refund", "user: b": "refund", "user: mail [email]": "deny"},
     )
     monkeypatch.setattr("stuntd.cli._make_decider", lambda settings: fake)
     return fake
@@ -157,6 +179,42 @@ def test_score_gold_without_usable_rows_has_no_rates():
     assert score.unseen_head_accuracy is None
 
 
+def test_score_gold_serves_the_zero_shot_answer_below_the_threshold():
+    rows = [
+        GoldRow("refund", "deny", 0.3, None, zero_shot="refund"),
+        GoldRow("deny", "deny", 0.9, None, zero_shot="refund"),
+    ]
+    score = score_gold(rows, 0.8, 0, "zeroshot")
+    assert score.served_accuracy == 1.0
+    assert score.local_share == 0.5
+    assert score.unserved == 0
+
+
+def test_score_gold_serves_the_head_below_the_threshold_when_the_fallback_is_the_head():
+    rows = [
+        GoldRow("refund", "deny", 0.3, None, zero_shot="refund"),
+        GoldRow("deny", "deny", 0.9, None, zero_shot="refund"),
+    ]
+    score = score_gold(rows, 0.8, 0, "head")
+    assert score.served_accuracy == 0.5
+    assert score.local_share == 0.5
+
+
+def test_score_gold_sends_a_novel_row_to_the_fallback():
+    rows = [GoldRow("refund", "deny", 0.9, "refund", novel=True)]
+    score = score_gold(rows, 0.8, 0)
+    assert score.local_share == 0.0
+    assert score.served_accuracy == 1.0
+
+
+def test_render_gold_names_the_fallback():
+    score = score_gold([GoldRow("deny", "deny", 0.9, None)], 0.8, 0, "zeroshot")
+    assert (
+        "served accuracy 1.000 at threshold 0.80: 100% answered by the head,"
+        " the rest by the zeroshot fallback" in render_gold(site_model(), score)
+    )
+
+
 def test_render_gold_without_threshold_counts_rows_with_no_teacher():
     score = score_gold([GoldRow("deny", "deny", 1.0, None)], None, 0)
     assert (
@@ -180,6 +238,53 @@ def test_report_gold_prints_the_scores(data_dir, trained, decider, gold, capsys)
     assert decider.asked == ["user: a", "user: b", "user: mail [email]"]
 
 
+def test_report_gold_in_local_mode_scores_the_zero_shot_fallback(
+    data_dir, trained, decider, gold, capsys
+):
+    record(data_dir, ("user: a", "refund"), schema=JEV_CANONICAL)
+    assert main(["report", "s1", "--gold", gold]) == 0
+    assert capsys.readouterr().out.splitlines()[3] == (
+        "served accuracy 1.000 at threshold 0.80: 67% answered by the head,"
+        " the rest by the zeroshot fallback"
+    )
+    assert decider.questions == [{"s1": JEV_QUESTION}] * 3
+
+
+def test_report_gold_in_local_mode_scores_the_head_fallback(
+    data_dir, trained, decider, gold, capsys
+):
+    record(data_dir, ("user: a", "refund"), schema=JEV_CANONICAL)
+    (data_dir / "stuntd.toml").write_text('[serving]\nlocal_fallback = "head"\n', encoding="utf-8")
+    assert main(["report", "s1", "--gold", gold]) == 0
+    assert capsys.readouterr().out.splitlines()[3] == (
+        "served accuracy 0.667 at threshold 0.80: 67% answered by the head,"
+        " the rest by the head fallback"
+    )
+    assert decider.questions == []
+
+
+def test_report_gold_in_local_mode_sends_a_novel_request_to_the_fallback(
+    data_dir, decider, gold, capsys
+):
+    save_model(data_dir / "models", replace(site_model(), novelty_cutoff=0.3))
+    decider.novelty = {"user: a": 0.5}
+    record(data_dir, ("user: a", "refund"), schema=JEV_CANONICAL)
+    assert main(["report", "s1", "--gold", gold, "--json"]) == 0
+    score = json.loads(capsys.readouterr().out)
+    assert score["local_share"] == pytest.approx(1 / 3)
+    assert score["served_accuracy"] == pytest.approx(2 / 3)
+
+
+def test_report_gold_with_a_jev_provider_scores_the_teacher(
+    data_dir, trained, decider, gold, capsys
+):
+    record(data_dir, ("user: a", "refund"), ("user: b", "refund"), schema=JEV_CANONICAL)
+    (data_dir / "stuntd.toml").write_text('[jev]\nupstream = "http://jev"\n', encoding="utf-8")
+    assert main(["report", "s1", "--gold", gold]) == 0
+    assert "answered locally" in capsys.readouterr().out
+    assert decider.questions == []
+
+
 def test_report_gold_json_gives_the_same_numbers(data_dir, trained, decider, gold, capsys):
     record(data_dir, ("user: a", "refund"), ("user: a", "deny"), ("user: b", "refund"))
     assert main(["report", "s1", "--gold", gold, "--json"]) == 0
@@ -192,6 +297,7 @@ def test_report_gold_json_gives_the_same_numbers(data_dir, trained, decider, gol
         "head_accuracy": pytest.approx(2 / 3),
         "unseen_rows": 1,
         "unseen_head_accuracy": 1.0,
+        "fallback": None,
         "served_accuracy": 1.0,
         "local_share": pytest.approx(2 / 3),
         "unserved": 0,

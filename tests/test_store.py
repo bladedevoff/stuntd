@@ -1,5 +1,6 @@
 import sqlite3
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -205,14 +206,15 @@ def test_comparisons_count_the_limit_in_comparisons(tmp_path):
     assert [row.confidence for row in rows] == [0.2, 0.1]
 
 
-def test_captures_since_counts_one_site_after_a_time(tmp_path, monkeypatch):
+def test_texts_since_lists_each_text_of_one_site_once_after_a_time(tmp_path, monkeypatch):
     store = Store(tmp_path / "c.sqlite", Redactor())
-    for moment, site in ((10.0, "s1"), (20.0, "s1"), (30.0, "s1"), (30.0, "s2")):
+    rows = ((10.0, "s1", "a"), (20.0, "s1", "b"), (30.0, "s1", "b"), (30.0, "s2", "c"))
+    for moment, site, text in rows:
         monkeypatch.setattr(time, "time", lambda moment=moment: moment)
-        store.record(make(site=site))
-    assert store.captures_since("s1", 10.0) == 2
-    assert store.captures_since("s1", 0.0) == 3
-    assert store.captures_since("s1", 30.0) == 0
+        store.record(make(site=site, text=text))
+    assert sorted(store.texts_since("s1", 10.0)) == ["b"]
+    assert sorted(store.texts_since("s1", 0.0)) == ["a", "b"]
+    assert store.texts_since("s1", 30.0) == []
     store.close()
 
 
@@ -231,3 +233,99 @@ def test_decisions_reject_zero_limit_and_read_back_unknown_site_and_false_agree(
     assert store.decisions("unknown", 5) == []
     assert store.decisions("s1", 5)[0].agree is False
     store.close()
+
+
+def test_sites_carry_the_schema_name_of_the_latest_capture(tmp_path):
+    store = Store(tmp_path / "c.sqlite", Redactor())
+    store.record(make(site="s1"))
+    store.record(replace(make(site="s2"), schema_name="triage"))
+    names = {info.site: info.name for info in store.sites()}
+    store.close()
+    assert names == {"s1": None, "s2": "triage"}
+
+
+def test_a_database_from_before_schema_names_is_upgraded(tmp_path):
+    path = tmp_path / "c.sqlite"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "create table captures (id integer primary key, site text not null,"
+        " schema_canonical text not null, kind text not null, input_text text not null,"
+        " answer text not null, model text not null, latency_ms integer not null,"
+        " prompt_tokens integer, completion_tokens integer, created_at real not null)"
+    )
+    connection.execute(
+        "insert into captures values (1, 's1', '{}', 'choice', 'user: hi', 'allow', 'm', 1, 1, 1, 1)"
+    )
+    connection.commit()
+    connection.close()
+    store = Store(path, Redactor())
+    store.record(replace(make(), schema_name="triage"))
+    names = [info.name for info in store.sites()]
+    store.close()
+    assert names == ["triage"]
+
+
+def test_forget_site_removes_its_captures_decisions_and_fields(tmp_path):
+    store = Store(tmp_path / "c.sqlite", Redactor())
+    for site in ("a", "a.x", "ab", "b"):
+        store.record(make(site=site))
+        store.record_decision(decision(site=site))
+    store.forget_site("a")
+    remaining = sorted(info.site for info in store.sites())
+    decided = sorted(store.decision_counts())
+    store.close()
+    assert remaining == decided == ["ab", "b"]
+
+
+def test_forget_site_removes_aliases_that_name_it(tmp_path):
+    store = Store(tmp_path / "c.sqlite", Redactor())
+    store.record(make(site="old"))
+    store.rename_site("old", "new")
+    store.forget_site("new")
+    resolved = store.resolve("old")
+    store.close()
+    assert resolved == "old"
+
+
+def test_rename_site_moves_captures_decisions_and_fields(tmp_path):
+    store = Store(tmp_path / "c.sqlite", Redactor())
+    for site in ("a", "a.x", "ab"):
+        store.record(make(site=site))
+        store.record_decision(decision(site=site))
+    store.rename_site("a", "z")
+    renamed = sorted(info.site for info in store.sites())
+    decided = sorted(store.decision_counts())
+    store.close()
+    assert renamed == decided == ["ab", "z", "z.x"]
+
+
+def test_resolve_follows_a_renamed_site(tmp_path):
+    path = tmp_path / "c.sqlite"
+    store = Store(path, Redactor())
+    store.record(make(site="old"))
+    store.rename_site("old", "new")
+    store.close()
+    store = Store(path, Redactor())
+    resolved = [store.resolve("old"), store.resolve("new"), store.resolve("other")]
+    store.close()
+    assert resolved == ["new", "new", "other"]
+
+
+def test_resolve_follows_a_site_renamed_twice(tmp_path):
+    store = Store(tmp_path / "c.sqlite", Redactor())
+    store.record(make(site="a"))
+    store.rename_site("a", "b")
+    store.rename_site("b", "c")
+    resolved = [store.resolve("a"), store.resolve("b")]
+    store.close()
+    assert resolved == ["c", "c"]
+
+
+def test_resolve_ignores_the_alias_of_a_name_that_is_a_site_again(tmp_path):
+    store = Store(tmp_path / "c.sqlite", Redactor())
+    store.record(make(site="a"))
+    store.rename_site("a", "b")
+    store.rename_site("b", "a")
+    resolved = [store.resolve("a"), store.resolve("b")]
+    store.close()
+    assert resolved == ["a", "a"]

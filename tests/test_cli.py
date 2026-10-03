@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -70,6 +71,17 @@ def test_config_init_writes_template_once(data_dir, capsys):
     assert main(["config", "init", "--force"]) == 0
 
 
+def test_config_show_prints_dotted_keys(data_dir, capsys):
+    assert main(["config", "show"]) == 0
+    out = capsys.readouterr().out
+    assert "training.epochs = 3  (default)" in out
+    assert "serving.window = 100  (default)" in out
+    assert "storage.max_rows = 100000  (default)" in out
+    assert "redaction.enabled = True  (default)" in out
+    assert "jev.upstream =   (default)" in out
+    assert "learn = True  (default)" in out
+
+
 def test_config_show_reports_sources(data_dir, capsys):
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "stuntd.toml").write_text("port = 9000\n", encoding="utf-8")
@@ -78,23 +90,23 @@ def test_config_show_reports_sources(data_dir, capsys):
     assert "upstream = http://flag  (flag)" in out
     assert "port = 9000  (file)" in out
     assert "host = 127.0.0.1  (default)" in out
-    assert "models_dir =   (default)" in out
-    assert "min_examples = 300  (default)" in out
-    assert "holdout = 0.2  (default)" in out
-    assert "target_agreement = 0.99  (default)" in out
-    assert "base_model = convaiinnovations/laya  (default)" in out
-    assert "epochs = 3  (default)" in out
-    assert "device = auto  (default)" in out
-    assert "check_share = 0.02  (default)" in out
-    assert "window = 100  (default)" in out
-    assert "min_window = 20  (default)" in out
-    assert "auto_promote = False  (default)" in out
-    assert "auto_promote_after_hours = 24  (default)" in out
-    assert "cache_size = 1000  (default)" in out
+    assert "storage.models_dir =   (default)" in out
+    assert "training.min_examples = 300  (default)" in out
+    assert "training.holdout = 0.2  (default)" in out
+    assert "training.target_agreement = 0.99  (default)" in out
+    assert "training.base_model = convaiinnovations/laya  (default)" in out
+    assert "training.epochs = 3  (default)" in out
+    assert "training.device = auto  (default)" in out
+    assert "serving.check_share = 0.02  (default)" in out
+    assert "serving.window = 100  (default)" in out
+    assert "serving.min_window = 20  (default)" in out
+    assert "serving.auto_promote = False  (default)" in out
+    assert "serving.auto_promote_after_hours = 24  (default)" in out
+    assert "serving.cache_size = 1000  (default)" in out
     assert "learn = True  (default)" in out
-    assert "jev_upstream =   (default)" in out
-    assert "jev_require_key = False  (default)" in out
-    assert "jev_model_name = stuntd  (default)" in out
+    assert "jev.upstream =   (default)" in out
+    assert "jev.require_key = False  (default)" in out
+    assert "jev.model_name = stuntd  (default)" in out
 
 
 def test_config_init_creates_the_parent_directory(data_dir, tmp_path, capsys):
@@ -108,7 +120,7 @@ def test_config_show_reports_a_port_flag(data_dir, capsys):
     assert main(["config", "show", "--port", "1234"]) == 0
     out = capsys.readouterr().out
     assert "port = 1234  (flag)" in out
-    assert "redaction_patterns =   (default)" in out
+    assert "redaction.patterns =   (default)" in out
 
 
 def test_config_show_joins_redaction_patterns(data_dir, capsys):
@@ -117,7 +129,7 @@ def test_config_show_joins_redaction_patterns(data_dir, capsys):
         "[redaction]\npatterns = ['A-\\d', 'B-\\d']\n", encoding="utf-8"
     )
     assert main(["config", "show"]) == 0
-    assert "redaction_patterns = A-\\d, B-\\d  (file)" in capsys.readouterr().out
+    assert "redaction.patterns = A-\\d, B-\\d  (file)" in capsys.readouterr().out
 
 
 def test_unusable_config_path_is_reported(data_dir, tmp_path, capsys):
@@ -136,7 +148,7 @@ def test_serve_without_an_upstream_serves_only_jev(data_dir, capsys, monkeypatch
     recorded["app"].state.store.close()
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == "stuntd listening on http://127.0.0.1:8787"
-    assert lines[1] == "no upstream: only the Jev routes are served"
+    assert lines[1] == "endpoints: jev local"
 
 
 def test_config_init_under_a_file_is_reported(data_dir, tmp_path, capsys):
@@ -224,6 +236,109 @@ def test_serve_starts_and_terminates_cleanly(data_dir):
     assert proc.returncode is not None
 
 
+@pytest.mark.parametrize(
+    ("argv", "config", "endpoints"),
+    [
+        (["--upstream", "http://127.0.0.1:9"], "", "openai, anthropic, jev local"),
+        ([], "", "jev local"),
+        (["--upstream", "http://127.0.0.1:9"], REMOTE_JEV, "openai, anthropic, jev proxy"),
+        ([], REMOTE_JEV, "jev proxy"),
+    ],
+    ids=["upstream", "no-upstream", "upstream-and-jev-provider", "jev-provider-only"],
+)
+def test_serve_names_the_endpoints_it_serves(
+    data_dir, capsys, monkeypatch, argv, config, endpoints
+):
+    write_config(data_dir, config)
+    recorded = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: recorded.update(app=app))
+    monkeypatch.setattr("stuntd.cli._make_decider", lambda settings: WarmingDecider())
+    assert main(["serve", *argv]) == 0
+    recorded["app"].state.store.close()
+    assert f"endpoints: {endpoints}" in capsys.readouterr().out.splitlines()
+
+
+def test_serve_records_its_pid_while_it_runs(data_dir, monkeypatch):
+    seen = {}
+
+    def run(app, **kwargs):
+        seen["pid"] = (data_dir / "stuntd.pid").read_text(encoding="utf-8")
+        seen["app"] = app
+
+    monkeypatch.setattr(uvicorn, "run", run)
+    monkeypatch.setattr("stuntd.cli._make_decider", lambda settings: WarmingDecider())
+    assert main(["serve"]) == 0
+    seen["app"].state.store.close()
+    assert seen["pid"] == str(os.getpid())
+    assert not (data_dir / "stuntd.pid").exists()
+
+
+def test_stop_ends_the_daemon_named_by_the_pid_file(data_dir, capsys, monkeypatch):
+    killed = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    data_dir.mkdir(parents=True)
+    (data_dir / "stuntd.pid").write_text("4242", encoding="utf-8")
+    assert main(["stop"]) == 0
+    assert killed == [(4242, signal.SIGTERM)]
+    assert not (data_dir / "stuntd.pid").exists()
+    assert "stopped stuntd (pid 4242)" in capsys.readouterr().out
+
+
+def test_stop_without_a_pid_file_says_nothing_is_running(data_dir, capsys):
+    assert main(["stop"]) == 1
+    assert "stuntd is not running" in capsys.readouterr().err
+
+
+def test_stop_removes_the_pid_file_of_a_daemon_that_is_gone(data_dir, capsys, monkeypatch):
+    def gone(pid, sig):
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(os, "kill", gone)
+    data_dir.mkdir(parents=True)
+    (data_dir / "stuntd.pid").write_text("4242", encoding="utf-8")
+    assert main(["stop"]) == 1
+    assert not (data_dir / "stuntd.pid").exists()
+    assert "stuntd is not running" in capsys.readouterr().err
+
+
+def test_stop_removes_the_pid_file_when_the_os_reports_a_dead_pid_as_oserror(
+    data_dir, capsys, monkeypatch
+):
+    def gone(pid, sig):
+        raise OSError(22, "The parameter is incorrect")
+
+    monkeypatch.setattr(os, "kill", gone)
+    data_dir.mkdir(parents=True)
+    (data_dir / "stuntd.pid").write_text("4242", encoding="utf-8")
+    assert main(["stop"]) == 1
+    assert not (data_dir / "stuntd.pid").exists()
+    assert "stuntd is not running" in capsys.readouterr().err
+
+
+def test_stop_ends_a_running_daemon(data_dir):
+    write_config(data_dir, REMOTE_JEV)
+    port = free_port()
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "stuntd", "serve", "--port", str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "STUNTD_DATA_DIR": str(data_dir)},
+    )
+    try:
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            with socket.socket() as s:
+                if s.connect_ex(("127.0.0.1", port)) == 0:
+                    break
+            time.sleep(0.2)
+        assert main(["stop"]) == 0
+        assert proc.wait(timeout=10) is not None
+    finally:
+        proc.kill()
+        proc.wait()
+    assert not (data_dir / "stuntd.pid").exists()
+
+
 SPAM = '{"properties":{"spam":{"type":"boolean"}},"type":"object"}'
 
 
@@ -300,6 +415,30 @@ def test_train_warnings_go_to_stderr(data_dir, capsys, monkeypatch):
     assert main(["train"]) == 0
     assert capsys.readouterr().err == "stuntd: s1: trains uncached\n"
     assert logging.getLogger("stuntd").handlers == []
+
+
+def progress_trainer_factory(settings):
+    trained = fake_trainer_factory(settings)
+
+    def trainer(dataset, head_path):
+        for epoch in (1, 2):
+            logging.getLogger("stuntd.train.trainer").info(
+                "%s epoch %d/2 loss %.4f", dataset.site, epoch, 1 / epoch
+            )
+        return trained(dataset, head_path)
+
+    return trainer
+
+
+def test_train_prints_a_line_per_epoch_on_stderr(data_dir, capsys, monkeypatch):
+    seed_captures(data_dir)
+    write_training_config(data_dir)
+    monkeypatch.setattr("stuntd.cli._make_trainer", progress_trainer_factory)
+    assert main(["train"]) == 0
+    assert capsys.readouterr().err == (
+        "stuntd: s1 epoch 1/2 loss 1.0000\nstuntd: s1 epoch 2/2 loss 0.5000\n"
+    )
+    assert logging.getLogger("stuntd").level == logging.NOTSET
 
 
 def test_the_trainer_is_built_from_the_training_settings(monkeypatch):
@@ -417,6 +556,13 @@ def skip_extra_check(monkeypatch):
     monkeypatch.setattr("stuntd.cli._require_serving", lambda: None)
 
 
+def set_coverage(data_dir, coverage):
+    meta = data_dir / "models" / "s1" / "meta.json"
+    raw = json.loads(meta.read_text(encoding="utf-8"))
+    raw["coverage"] = coverage
+    meta.write_text(json.dumps(raw), encoding="utf-8")
+
+
 def mode_of(data_dir, site="s1"):
     path = data_dir / "models" / site / "mode.json"
     return json.loads(path.read_text(encoding="utf-8"))["mode"]
@@ -491,16 +637,41 @@ def test_enable_warns_about_a_head_that_covers_little(
     data_dir, capsys, monkeypatch, coverage, warning
 ):
     train_site(data_dir, monkeypatch, capsys)
-    meta = data_dir / "models" / "s1" / "meta.json"
-    raw = json.loads(meta.read_text(encoding="utf-8"))
-    raw["coverage"] = coverage
-    meta.write_text(json.dumps(raw), encoding="utf-8")
+    (data_dir / "stuntd.toml").write_text('upstream = "http://up"\n', encoding="utf-8")
+    set_coverage(data_dir, coverage)
     skip_extra_check(monkeypatch)
     assert main(["enable", "s1"]) == 0
     captured = capsys.readouterr()
     assert captured.err.strip() == warning
     assert captured.out.strip() == "s1: live"
     assert mode_of(data_dir) == "live"
+
+
+@pytest.mark.parametrize(
+    ("coverage", "fallback", "warning"),
+    [
+        (
+            0.4,
+            "zeroshot",
+            "stuntd: s1 covers 40% of the holdout at target 0.99;"
+            " the rest is answered zero-shot by the base checkpoint",
+        ),
+        (0.5, "zeroshot", ""),
+        (0.4, "head", ""),
+    ],
+    ids=["covers-little", "covers-enough", "head-fallback"],
+)
+def test_enable_in_local_mode_warns_that_the_rest_is_answered_zero_shot(
+    data_dir, capsys, monkeypatch, coverage, fallback, warning
+):
+    train_site(data_dir, monkeypatch, capsys)
+    (data_dir / "stuntd.toml").write_text(
+        f'[serving]\nlocal_fallback = "{fallback}"\n', encoding="utf-8"
+    )
+    set_coverage(data_dir, coverage)
+    skip_extra_check(monkeypatch)
+    assert main(["enable", "s1"]) == 0
+    assert capsys.readouterr().err.strip() == warning
 
 
 @pytest.mark.parametrize(
@@ -535,6 +706,42 @@ def test_enable_and_disable_switch_the_mode(data_dir, capsys, monkeypatch):
     assert mode_of(data_dir) == "shadow"
 
 
+def train_sites(data_dir, monkeypatch, capsys, *sites):
+    for site in sites:
+        seed_captures(data_dir, site=site)
+    write_training_config(data_dir)
+    monkeypatch.setattr("stuntd.cli._make_trainer", fake_trainer_factory)
+    skip_extra_check(monkeypatch)
+    assert main(["train"]) == 0
+    capsys.readouterr()
+
+
+def test_enable_and_disable_act_on_every_field_of_a_parent(data_dir, capsys, monkeypatch):
+    train_sites(data_dir, monkeypatch, capsys, "triage.category", "triage.urgent")
+    assert main(["enable", "triage"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["triage.category: live", "triage.urgent: live"]
+    assert mode_of(data_dir, "triage.category") == mode_of(data_dir, "triage.urgent") == "live"
+    assert main(["disable", "triage"]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "triage.category: shadow",
+        "triage.urgent: shadow",
+    ]
+    assert mode_of(data_dir, "triage.category") == mode_of(data_dir, "triage.urgent") == "shadow"
+
+
+def test_enable_a_site_that_is_also_a_parent_leaves_its_fields_alone(data_dir, capsys, monkeypatch):
+    train_sites(data_dir, monkeypatch, capsys, "triage", "triage.urgent")
+    assert main(["enable", "triage"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["triage: live"]
+    assert mode_of(data_dir, "triage.urgent") == "shadow"
+
+
+def test_enable_a_parent_without_fields_is_reported(data_dir, capsys, monkeypatch):
+    train_sites(data_dir, monkeypatch, capsys, "other")
+    assert main(["enable", "triage"]) == 2
+    assert "stuntd: no model for triage" in capsys.readouterr().err
+
+
 def test_enable_without_torch_explains_the_extra(data_dir, capsys, monkeypatch):
     train_site(data_dir, monkeypatch, capsys)
     monkeypatch.setitem(sys.modules, "stuntd.serve.decider", None)
@@ -565,6 +772,7 @@ def test_status_shows_a_site_without_a_model_as_collecting(data_dir, capsys):
         "sites": [
             {
                 "site": "s1",
+                "name": None,
                 "mode": "collect",
                 "captures": 10,
                 "shadow": 0,
@@ -592,6 +800,7 @@ def test_status_shows_modes_counts_and_agreement(data_dir, capsys, monkeypatch):
         "sites": [
             {
                 "site": "s1",
+                "name": None,
                 "mode": "live",
                 "captures": 10,
                 "shadow": 2,
@@ -610,6 +819,21 @@ def test_status_shows_modes_counts_and_agreement(data_dir, capsys, monkeypatch):
         "1",
         "0.500",
         "-",
+    ]
+
+
+def test_status_shows_a_site_retrained_over_a_live_one(data_dir, capsys, monkeypatch):
+    train_site(data_dir, monkeypatch, capsys)
+    skip_extra_check(monkeypatch)
+    assert main(["enable", "s1"]) == 0
+    assert main(["train"]) == 0
+    capsys.readouterr()
+    assert main(["status"]) == 0
+    assert capsys.readouterr().out.splitlines()[1].split()[1:5] == [
+        "shadow",
+        "(retrained,",
+        "was",
+        "live)",
     ]
 
 
@@ -640,7 +864,7 @@ def test_serve_builds_a_decider_for_a_serving_site(data_dir, capsys, monkeypatch
     assert recorded["app"].state.runtime._decider is decider
     lines = capsys.readouterr().out.splitlines()
     assert lines[0].startswith("stuntd listening on http://127.0.0.1:")
-    assert lines[1] == "serving 1 site(s) with convaiinnovations/laya"
+    assert lines[2] == "serving 1 site(s) with convaiinnovations/laya"
 
 
 class WarmingDecider:
@@ -768,6 +992,7 @@ def test_status_shows_a_trained_site_without_a_database(data_dir, capsys, monkey
         "sites": [
             {
                 "site": "s1",
+                "name": None,
                 "mode": "shadow",
                 "captures": 0,
                 "shadow": 0,

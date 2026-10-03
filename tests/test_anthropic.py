@@ -247,7 +247,7 @@ async def test_relay_captures_a_tool_use_answer_per_field(data_dir):
             {"model": "claude-x", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]},
             "no-schema",
         ),
-        ({**TOOL_REQUEST, "tools": [FREE_TEXT_TOOL]}, "no-schema"),
+        ({**TOOL_REQUEST, "tools": [FREE_TEXT_TOOL]}, "unsupported-schema"),
     ],
     ids=["stream", "free-text", "free-text-tool"],
 )

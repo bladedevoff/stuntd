@@ -253,7 +253,7 @@ def test_config_show_reports_learn(data_dir, capsys):
     assert "learn = False  (file)" in capsys.readouterr().out
 
 
-def test_serve_reports_learning_off_on_its_third_line(data_dir, capsys, monkeypatch):
+def test_serve_reports_learning_off_after_what_it_serves(data_dir, capsys, monkeypatch):
     write_config(data_dir)
     recorded = {}
     monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: recorded.update(app=app))
@@ -262,5 +262,5 @@ def test_serve_reports_learning_off_on_its_third_line(data_dir, capsys, monkeypa
     assert recorded["app"].state.store is None
     lines = capsys.readouterr().out.splitlines()
     assert lines[0].startswith("stuntd listening on http://127.0.0.1:")
-    assert lines[1] == "serving jev locally with convaiinnovations/laya"
-    assert lines[2] == "learning off"
+    assert lines[2] == "serving jev locally with convaiinnovations/laya"
+    assert lines[3] == "learning off"

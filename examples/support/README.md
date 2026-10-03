@@ -12,7 +12,8 @@ claims the whole team is down, and each template reads its time phrases from the
 ("all week" for something still happening, "last month" for an admin who left). Nothing but the
 standard library.
 
-The demo needs `pip install typesafe-sdk`; the daemon needs `pip install "stuntd[train]"`.
+The demo needs `pip install typesafe-sdk`; the daemon needs `pip install "stuntd[train]"`. Both come
+with `pip install "stuntd[train,jev]"`.
 
 ## The questions and the state
 
@@ -84,7 +85,7 @@ it points at `stuntd status --json` instead.
 The demo sets two keys in `stuntd.toml`: `training.base_model`, which points at a local Laya
 checkpoint, and `training.epochs = 24`. Leave `upstream` commented out -- with no OpenAI upstream
 the daemon serves the Jev routes alone and says so, `no upstream: only the Jev routes are served`.
-Everything else is the default, `target_agreement = 0.99` included. 24 epochs and 3000 rows are
+Everything else is the default, `target_agreement = 0.99` and the novelty gate included. 24 epochs and 3000 rows are
 both measured choices, not guesses -- the numbers below say what each one buys.
 
 `stuntd status --json` reports `"agreement": null` for every site here: in local mode nothing
@@ -94,34 +95,69 @@ put in front of it.
 ## What it measured
 
 3000 tickets from seed 1, so 3000 rows per site; `stuntd train` fitted 2400 and held 600 back per
-site and took **362 s for the three sites at `epochs = 24` with the encoder cache** on a laptop
+site and took **266 s for the three sites at `epochs = 24` with the encoder cache** on a laptop
 RTX 5060, with `convaiinnovations/laya` as the base checkpoint. `stuntd report`:
 
 | site | holdout agreement | ECE | operating point at target 0.99 |
 | --- | --- | --- | --- |
-| `category` | 0.992 | 0.024 | coverage 1.00 at agreement 0.992 |
-| `needs_human` | 0.963 | 0.078 | coverage 0.93 at agreement 0.991 |
-| `urgency` | 0.935 | 0.076 | coverage 0.71 at agreement 0.991 |
+| `category` | 0.990 | 0.011 | coverage 1.00 at agreement 0.990 |
+| `needs_human` | 0.970 | 0.079 | coverage 0.94 at agreement 0.991 |
+| `urgency` | 0.922 | 0.092 | coverage 0.73 at agreement 0.991 |
 
-Then 200 tickets no training row contained, before and after `stuntd enable`:
+Then 200 tickets no training row contained, before and after `stuntd enable`. These two runs
+were measured before the novelty gate existed; with the gate on, the share answered by a head is
+lower (see the gate numbers below):
 
 | run | category | urgency | needs_human | p50 per request | answered by a head |
 | --- | --- | --- | --- | --- | --- |
-| base Laya, zero-shot | 69.5% | 34.5% | 66.5% | 40.8 ms | 0/600 |
-| trained heads | 99.5% | 85.5% | 97.5% | 90.3 ms | 542/600 (90.3%) |
+| base Laya, zero-shot | 69.5% | 34.5% | 69.5% | 32.4 ms | 0/600 |
+| trained heads | 99.5% | 84.0% | 95.0% | 82.8 ms | 543/600 (90.5%) |
 
 Run it again and the numbers move a little. The same head retrained on the same rows at three
 seeds in the devtools demo scored 0.985, 0.978 and 0.973 on its holdout, at coverage 0.98, 0.98
-and 0.95, so a site quoted at 0.96 here is a site that lands near 0.96, not on it.
+and 0.95, so a site quoted at 0.97 here is a site that lands near 0.97, not on it.
 
 **Why 24 epochs and 3000 rows.** Both were measured, on `urgency`, the hardest of the three sites:
 at 1500 rows it scores 0.323 at 3 epochs (the default), 0.510 at 12 and 0.643 at 24; at 3000 rows
 and 24 epochs it reaches 0.890, and 0.935 once the generator stopped pairing outage sentences with
 feature requests. Every site gained from the extra rows, so the demo ships at 3000. The cost is the
-362 s above: the frozen encoder runs once per site and every epoch after that reads its cached
+266 s above: the frozen encoder runs once per site and every epoch after that reads its cached
 output. At the default 3 epochs the same three sites answer almost nothing.
 
 `urgency` is the one site under the 0.95 target, and it stays because its operating point is
-honest: it answers 71% of the tickets at 99.1% agreement and hands the rest to the provider. Its
+honest: it answers 73% of the tickets at 99.1% agreement and hands the rest to the provider. Its
 four levels are a combination of two independent cues -- how bad it is, and whether there is a
 deadline -- which is harder to read off one pooled embedding than the presence of a phrase.
+
+**What these numbers do not measure.** The tickets come from 20 templates, and a label depends only
+on the template and the impact and tail sentences added to it: 258 combinations in the 3000 rows.
+The 200 test tickets are states the training rows did not contain, but nearly all of them repeat a
+combination the heads trained on, with a different product, amount or number. So the table above
+measures new wording of known tickets, not new kinds of ticket. Two checks say more, both run on
+1000 tickets:
+
+| check | all three heads sure | all three right when sure |
+| --- | --- | --- |
+| new states of the 20 trained templates | 72.3% | 97.2% |
+| one template per category left out of training, tested on those five | 40.0% | 61.0% |
+
+On the left-out templates `category` was sure on 71.5% and right on 87.8% of those, `urgency` on
+60.2% and 81.7%, `needs_human` on 94.4% and 89.0%. These numbers move far more between runs than
+the ones above: an earlier run of the same check had `category` sure on every ticket and right on
+two thirds. Changing only `channel` and `plan`, which no rule reads, changes the answer of
+`category` on 2.1% of the tickets, `needs_human` on 3.5% and `urgency` on 10.2%.
+
+**The novelty gate.** `serving.novelty_gate` is on by default, and these checks were repeated with
+it. With one template per category held out (heads trained on 3,000 rows of the other 15
+templates), the gate stopped all 1,000 tickets from the held-out templates; without it all three
+heads were sure on 40.0% and all three right on 61.0% of those. On 1,000 unseen states of the 15
+trained templates (seed 10001), 76.6% were answered locally without the gate and 70.6% with it,
+and all three were right on 97.4% and 97.7% of the local ones. The heads trained on all 20
+templates answered 72.3% of the unseen states locally without the gate and 66.9% with it, and the
+gate stopped 8.1% of them. "What's the weather in Paris", `asdf qwer zxcv` and an empty state were
+stopped on all three heads. The main README's [novelty gate](../../README.md#the-novelty-gate)
+section has the details and what it costs.
+
+Both checks above were suggested by Dipankar Sarkar on the Hugging Face page of these heads, who also
+found that the stuck-payout template tripped the "money back" cue without anyone asking for a
+refund; its wording is fixed.

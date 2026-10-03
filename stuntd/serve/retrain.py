@@ -4,6 +4,8 @@ import asyncio
 import logging
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from anyio import to_thread
@@ -29,7 +31,7 @@ def last_result(site: str) -> str | None:
 
 
 class Retrainer:
-    """Starts `stuntd train` for a site once enough new captures have arrived, one run at a time."""
+    """Starts `stuntd train` for a site once enough new texts have arrived, one run at a time."""
 
     def __init__(
         self,
@@ -37,29 +39,41 @@ class Retrainer:
         store: Store,
         runtime: Runtime,
         config: Path | None,
+        now: Callable[[], float] = time.time,
     ) -> None:
         self._settings = settings
         self._store = store
         self._runtime = runtime
         self._command = [sys.executable, "-m", "stuntd", "train"]
         self._config = [] if config is None else ["--config", str(config)]
-        self._pending: dict[str, int] = {}
+        self._now = now
+        self._seen: dict[str, set[int]] = {}
+        self._finished: dict[str, float] = {}
         self._training: asyncio.Task[None] | None = None
 
     def __repr__(self) -> str:
-        return f"Retrainer(after={self._settings.auto_retrain}, pending={self._pending})"
+        pending = {site: len(texts) for site, texts in self._seen.items()}
+        return f"Retrainer(after={self._settings.auto_retrain}, pending={pending})"
 
-    def record(self, site: str) -> None:
-        """Counts one capture of site and starts a training run once enough have arrived."""
+    def record(self, site: str, text: str) -> None:
+        """Counts text as captured for site and starts a training run once enough distinct texts
+        have arrived."""
         model = self._runtime.state(site).model
-        if site in self._pending:
-            self._pending[site] += 1
+        if site in self._seen:
+            self._seen[site].add(hash(self._store.redact(text)))
         else:
             since = 0.0 if model is None else model.trained_at
-            self._pending[site] = self._store.captures_since(site, since)
-        if self._training is not None or self._pending[site] < self._settings.auto_retrain:
+            self._seen[site] = {hash(stored) for stored in self._store.texts_since(site, since)}
+        seen = self._seen[site]
+        if self._training is not None or len(seen) < self._settings.auto_retrain:
             return
-        if model is None and self._pending[site] < self._settings.min_examples:
+        if model is None and len(seen) < self._settings.min_examples:
+            return
+        finished = self._finished.get(site)
+        if (
+            finished is not None
+            and self._now() - finished < self._settings.auto_retrain_min_minutes * 60
+        ):
             return
         self._training = asyncio.create_task(self._train(site))
 
@@ -78,7 +92,8 @@ class Retrainer:
             result = "failed (not started)"
         finally:
             self._training = None
-            self._pending[site] = 0
+            self._seen[site] = set()
+            self._finished[site] = self._now()
         write_private(logs / f"train-{site}.result", result)
 
     def _execute(self, site: str, log: Path) -> int:

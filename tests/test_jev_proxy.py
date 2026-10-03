@@ -1,6 +1,6 @@
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
 import pytest
@@ -87,6 +87,7 @@ class FakeVerdict:
     confidence: float
     latency_ms: int
     probabilities: tuple[float, ...]
+    novelty: float | None = None
 
 
 SURE_ANGRY = FakeVerdict(1, 0.9, 7, (0.25, 0.75))
@@ -299,6 +300,20 @@ async def test_one_question_the_heads_cannot_answer_sends_the_whole_request_out(
     rows = app.state.store.decisions("tone", 10)
     assert [(row.mode, row.answer, row.agree) for row in rows] == [("check", "angry", True)]
     assert captures(app, "site, answer") == [("tone", "angry"), ("billing", "true")]
+
+
+async def test_a_request_unlike_the_training_rows_goes_to_the_provider(proxying):
+    provider = Provider()
+    app = proxying(
+        transport_for(provider),
+        model=replace(site_model("tone"), novelty_cutoff=0.3),
+        mode=MODE_LIVE,
+        decider=FakeDecider(FakeVerdict(1, 0.9, 7, (0.25, 0.75), 0.5)),
+    )
+    response = await post(app, {"tone": TONE})
+    assert provider.calls == 1
+    assert response.content == PROVIDER_BODY
+    assert captures(app, "site, answer") == [("tone", "angry")]
 
 
 async def test_a_shadow_site_compares_its_head_with_the_provider_answer(proxying):

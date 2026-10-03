@@ -6,6 +6,7 @@ import logging
 import re
 import sqlite3
 import time
+from collections import Counter
 from collections.abc import AsyncIterator
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
@@ -32,10 +33,17 @@ from stuntd.proxy.headers import (
     stuntd_header,
 )
 from stuntd.proxy.jev import JevRoutes
-from stuntd.serve.modes import MODE_CHECK, MODE_COLLECT, MODE_LIVE, MODE_SHADOW, SiteState
+from stuntd.serve.modes import (
+    MODE_CHECK,
+    MODE_COLLECT,
+    MODE_LIVE,
+    MODE_SHADOW,
+    SiteState,
+    site_states,
+)
 from stuntd.serve.retrain import Retrainer
 from stuntd.serve.runtime import DeciderLike, Outcome, Runtime, input_hash
-from stuntd.settings import Settings, database_path
+from stuntd.settings import Settings, database_path, models_path
 from stuntd.store.db import Capture, Store
 from stuntd.store.redact import Redactor
 
@@ -100,6 +108,12 @@ class Proxy:
     def __repr__(self) -> str:
         # httpx.URL hides the password of an upstream that carries credentials.
         return f"Proxy(upstream={self.client.base_url!r}, store={self.store!r})"
+
+    async def healthz(self, request: Request) -> Response:
+        """Answers 200 with how many sites serve in each mode, without touching a checkpoint."""
+        states = site_states(models_path(self.settings)) if self.settings.learn else []
+        sites = dict(Counter(state.mode for state in states))
+        return JSONResponse({"status": "ok", "learning": self.settings.learn, "sites": sites})
 
     async def relay(self, request: Request) -> Response:
         if not self.settings.upstream:
@@ -173,6 +187,11 @@ class Proxy:
         override: str | None,
     ) -> Response:
         site = site_key(schema, dialect.system_prompt(payload), override)
+        try:
+            site = store.resolve(site)
+        except sqlite3.Error:
+            # A database that cannot be read must not stop the provider from answering.
+            _log.exception("site alias not read")
         text = dialect.input_text(payload)
         if isinstance(schema, DecisionSchema):
             states = [runtime.state(site)]
@@ -295,7 +314,7 @@ class Proxy:
                         store, dialect, payload, field, state.site, text, answer, parsed, latency_ms
                     )
                     if self.retrainer is not None:
-                        self.retrainer.record(state.site)
+                        self.retrainer.record(state.site, text)
         except sqlite3.Error:
             # The provider has already produced and billed this completion, so a database that
             # cannot take the capture must still not cost the caller the answer.
@@ -309,6 +328,8 @@ class Proxy:
                 # The shadow pass waits for the response to leave, so the model never adds its own
                 # latency to the caller's.
                 background.add_task(runtime.shadow, state, text, answer)
+            elif outcomes is None and state.mode == MODE_LIVE:
+                background.add_task(runtime.watch, state, text, answer)
             elif outcome is not None and outcome.reason == MODE_CHECK:
                 runtime.compare(state, outcome, answer)
         response.background = background
@@ -338,6 +359,7 @@ def _record(
             latency_ms,
             prompt_tokens,
             completion_tokens,
+            schema.name,
         )
     )
 
@@ -356,7 +378,7 @@ def _decision_request(
         return "no-schema"
     schema = dialect.detect(payload)
     if schema is None:
-        return "no-schema"
+        return "unsupported-schema" if dialect.declares_schema(payload) else "no-schema"
     if payload.get("stream") is True:
         return "streaming"
     return dialect, payload, schema
@@ -461,10 +483,11 @@ def build_app(
 
     jev = JevRoutes(proxy)
     # A Route with a function endpoint answers 405 to anything it was not given; which methods
-    # exist is the provider's business. The Jev routes come first, or the mount below would relay
-    # them to the OpenAI provider.
+    # exist is the provider's business. The daemon's own routes come first, or the mount below
+    # would relay them to the provider.
     app = Starlette(
         routes=[
+            Route("/healthz", proxy.healthz, methods=["GET"]),
             Route("/v1/systemone", jev.systemone, methods=["POST"]),
             Route("/v1/models", jev.models, methods=["GET"]),
             Mount("/", app=endpoint),

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -30,6 +30,7 @@ class FakeVerdict:
     confidence: float
     latency_ms: int
     probabilities: tuple[float, ...] = ()
+    novelty: float | None = None
 
 
 SURE = FakeVerdict(1, 0.9, 7)
@@ -139,6 +140,16 @@ def test_state_falls_back_to_collect_once_a_file_is_torn(models, store, caplog):
     assert runtime.state_reason("s1") is None
 
 
+def test_state_warns_once_that_a_retrained_site_was_live(models, store, caplog):
+    folder = save_model(models, model())
+    write_mode(folder, MODE_SHADOW, now=1.0, was_live=True)
+    runtime = runtime_for(models, store)
+    with caplog.at_level(logging.WARNING):
+        states = [runtime.state("s1") for _ in range(3)]
+    assert all(state.was_live for state in states)
+    assert caplog.text.count("s1 was retrained while live") == 1
+
+
 def test_state_is_cached_while_the_files_hold_still(models, store):
     save_model(models, model())
     runtime = runtime_for(models, store)
@@ -222,6 +233,37 @@ async def test_live_collects_when_the_model_is_unsure(models, store):
     runtime = runtime_for(models, store, FakeDecider(FakeVerdict(0, 0.4, 7)))
     outcome = await runtime.live(runtime.state("s1"), "user: hi")
     assert outcome == Outcome(MODE_COLLECT, "low-confidence", "false", 0.4, 7, ())
+
+
+@pytest.mark.anyio
+async def test_live_collects_a_request_unlike_the_training_rows(models, store):
+    save_model(models, replace(model(), novelty_cutoff=0.3))
+    runtime = runtime_for(models, store, FakeDecider(FakeVerdict(1, 0.9, 7, (), 0.31)))
+    outcome = await runtime.live(runtime.state("s1"), "user: hi")
+    assert outcome == Outcome(MODE_COLLECT, "novel", "true", 0.9, 7, ())
+
+
+@pytest.mark.anyio
+async def test_live_answers_a_request_at_the_novelty_cutoff(models, store):
+    save_model(models, replace(model(), novelty_cutoff=0.3))
+    runtime = runtime_for(models, store, FakeDecider(FakeVerdict(1, 0.9, 7, (), 0.3)))
+    outcome = await runtime.live(runtime.state("s1"), "user: hi")
+    assert outcome.mode == MODE_LIVE
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("cutoff", "novelty", "gate"),
+    [(None, 0.9, True), (0.3, None, True), (0.3, 0.9, False)],
+    ids=["head-without-cutoff", "head-without-embeddings", "gate-off"],
+)
+async def test_live_answers_when_nothing_gates_it(models, store, cutoff, novelty, gate):
+    save_model(models, replace(model(), novelty_cutoff=cutoff))
+    runtime = runtime_for(
+        models, store, FakeDecider(FakeVerdict(1, 0.9, 7, (), novelty)), novelty_gate=gate
+    )
+    outcome = await runtime.live(runtime.state("s1"), "user: hi")
+    assert outcome.mode == MODE_LIVE
 
 
 @pytest.mark.anyio

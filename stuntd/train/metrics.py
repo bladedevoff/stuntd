@@ -8,6 +8,7 @@ __all__ = [
     "ERROR_TEXT_CHARS",
     "ClassStats",
     "ConfidentError",
+    "Interval",
     "Operating",
     "Prediction",
     "confidence",
@@ -18,7 +19,9 @@ __all__ = [
     "operating_point",
     "per_class",
     "predict",
+    "quantile",
     "softmax",
+    "wilson_interval",
 ]
 
 ERROR_TEXT_CHARS = 80
@@ -28,15 +31,25 @@ _CONFIDENCE_DIGITS = 9
 _MIN_SCALE = 0.05
 _MAX_SCALE = 20.0
 _SEARCH_STEPS = 60
+_WILSON_Z = 1.96
 
 
 @dataclass(frozen=True)
 class Prediction:
-    """One holdout row: the answer it carried, the answer chosen for it, and how sure that was."""
+    """One holdout row: the answer it carried, the one chosen for it, and how sure that was."""
 
     label: int
     predicted: int
     confidence: float
+    probability: float
+
+
+@dataclass(frozen=True)
+class Interval:
+    """The range a proportion measured on a sample plausibly lies in."""
+
+    low: float
+    high: float
 
 
 @dataclass(frozen=True)
@@ -64,6 +77,7 @@ class ConfidentError:
     expected: int
     predicted: int
     confidence: float
+    probability: float | None = None
 
 
 def softmax(logits: Sequence[float], temperature: float = 1.0) -> list[float]:
@@ -85,6 +99,25 @@ def confidence(probs: Sequence[float]) -> float:
     # Rounded, because a distribution the float arithmetic cannot tell from one-hot must not
     # land a hair under the threshold fitted on a holdout that was just as separable.
     return round(min(1.0, max(0.0, 1.0 - entropy / math.log(len(probs)))), _CONFIDENCE_DIGITS)
+
+
+def wilson_interval(correct: int, total: int) -> Interval:
+    """The 95% Wilson score interval for a share of correct rows out of total."""
+    share = correct / total
+    spread = _WILSON_Z**2 / total
+    centre = (share + spread / 2.0) / (1.0 + spread)
+    margin = _WILSON_Z * math.sqrt(share * (1.0 - share) / total + spread / (4.0 * total))
+    margin /= 1.0 + spread
+    return Interval(max(0.0, centre - margin), min(1.0, centre + margin))
+
+
+def quantile(values: Sequence[float], level: float) -> float:
+    """The value below which a share `level` of the values lie, interpolating between ranks."""
+    ordered = sorted(values)
+    position = level * (len(ordered) - 1)
+    below = int(position)
+    above = min(below + 1, len(ordered) - 1)
+    return ordered[below] + (ordered[above] - ordered[below]) * (position - below)
 
 
 def _nll(logits: Sequence[Sequence[float]], labels: Sequence[int], scale: float) -> float:
@@ -119,7 +152,7 @@ def predict(
     for row, label in zip(logits, labels, strict=True):
         probs = softmax(row, temperature)
         chosen = max(range(len(probs)), key=lambda index: probs[index])
-        predictions.append(Prediction(label, chosen, confidence(probs)))
+        predictions.append(Prediction(label, chosen, confidence(probs), probs[chosen]))
     return predictions
 
 
@@ -190,6 +223,7 @@ def confident_errors(
             prediction.label,
             prediction.predicted,
             prediction.confidence,
+            prediction.probability,
         )
         for prediction, text in zip(predictions, texts, strict=True)
         if prediction.label != prediction.predicted

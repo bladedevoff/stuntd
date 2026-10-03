@@ -4,7 +4,16 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
-__all__ = ["choice_answer", "error_body", "noul_answer", "response_body", "score_answer"]
+__all__ = [
+    "answer_label",
+    "choice_answer",
+    "error_body",
+    "noul_answer",
+    "response_body",
+    "score_answer",
+]
+
+_NOUL_TRUE = 0.5
 
 
 def choice_answer(
@@ -40,6 +49,16 @@ def score_answer(
         "legend": dict(zip(keys, levels, strict=True)),
         "probabilities": dict(zip(keys, rounded, strict=True)),
     }
+
+
+def answer_label(answer: dict[str, Any]) -> str:
+    """The label a Jev answer stands for: the choice, the side of a noul, the likeliest score."""
+    if answer["type"] == "choice":
+        return str(answer["choice"])
+    if answer["type"] == "noul":
+        return "true" if float(answer["noul"]) >= _NOUL_TRUE else "false"
+    probabilities: dict[str, float] = answer["probabilities"]
+    return max(probabilities, key=probabilities.__getitem__)
 
 
 def response_body(model: str, answers: dict[str, dict[str, Any]], input_tokens: int) -> bytes:

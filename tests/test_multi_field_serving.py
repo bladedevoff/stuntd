@@ -67,6 +67,7 @@ class FakeVerdict:
     confidence: float
     latency_ms: int = 7
     probabilities: tuple[float, ...] = ()
+    novelty: float | None = None
 
 
 class FakeDecider:
@@ -221,6 +222,22 @@ async def test_multi_field_shadow_fields_record_how_the_model_compared(serving):
     assert response.headers["x-stuntd"] == f"shadow; site={SITE}; reason=not-live:category"
     assert decisions(app, "category") == [("shadow", "tech", True)]
     assert decisions(app, "urgent") == [("shadow", "true", False)]
+
+
+async def test_multi_field_live_field_beside_a_shadow_field_records_a_comparison(serving):
+    app = serving(Provider(), SURE, modes=(MODE_LIVE, MODE_SHADOW))
+    await post(app)
+    assert decisions(app, "category") == [("check", "tech", True)]
+    assert decisions(app, "urgent") == [("shadow", "true", False)]
+
+
+async def test_multi_field_live_field_beside_a_shadow_field_can_be_demoted(serving):
+    verdicts = {**SURE, f"{SITE}.category": FakeVerdict(0, 0.9)}
+    app = serving(
+        Provider(), verdicts, modes=(MODE_LIVE, MODE_SHADOW), min_window=1, target_agreement=0.9
+    )
+    await post(app)
+    assert read_mode(models_path(app.state.settings) / f"{SITE}.category")[0] == MODE_SHADOW
 
 
 async def test_multi_field_check_compares_every_field(serving):

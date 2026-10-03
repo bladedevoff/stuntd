@@ -1,3 +1,4 @@
+import itertools
 import json
 import logging
 import subprocess
@@ -102,15 +103,21 @@ def trained(site, trained_at):
 def retraining(data_dir, tmp_path):
     made = []
 
-    def make(config=None, **overrides):
-        settings = Settings(**{"auto_retrain": 2, "min_examples": 2, **overrides})
+    def make(config=None, now=None, **overrides):
+        settings = Settings(
+            **{"auto_retrain": 2, "min_examples": 2, "auto_retrain_min_minutes": 0, **overrides}
+        )
         store = Store(tmp_path / "captures.sqlite", Redactor())
         made.append(store)
-        retrainer = Retrainer(settings, store, Runtime(settings, store, None), config)
+        retrainer = Retrainer(
+            settings, store, Runtime(settings, store, None), config, *([now] if now else [])
+        )
+        texts = itertools.count()
 
-        def capture(site=SITE):
-            store.record(Capture(site, "{}", "choice", "user: x", "block", "gpt-x", 1, 1, 1))
-            retrainer.record(site)
+        def capture(site=SITE, text=None):
+            text = f"user: {next(texts)}" if text is None else text
+            store.record(Capture(site, "{}", "choice", text, "block", "gpt-x", 1, 1, 1))
+            retrainer.record(site, text)
 
         return settings, capture
 
@@ -241,9 +248,10 @@ async def test_proxy_serves_requests_while_a_run_is_in_progress(data_dir, traini
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://proxy"
     ) as client:
-        for _ in range(4):
+        for index in range(4):
+            request = {**REQUEST, "messages": [{"role": "user", "content": f"buy pills {index}"}]}
             response = await client.post(
-                "/v1/chat/completions", json=REQUEST, headers={"X-Stuntd-Site": SITE}
+                "/v1/chat/completions", json=request, headers={"X-Stuntd-Site": SITE}
             )
             assert response.content == UPSTREAM_BODY
     await until(lambda: training.commands)
@@ -289,3 +297,48 @@ async def test_retrainer_trains_again_after_a_failure_to_prepare_the_logs(
     capture()
     capture()
     await until(lambda: training.commands)
+
+
+async def test_retrainer_does_not_count_a_repeated_text_twice(retraining, training):
+    _, capture = retraining()
+    for _ in range(5):
+        capture(text="user: same")
+    await anyio.sleep(0.05)
+    assert training.commands == []
+    capture(text="user: other")
+    await until(lambda: training.commands)
+
+
+async def test_retrainer_waits_the_minimum_minutes_between_runs_of_a_site(retraining, training):
+    clock = [1000.0]
+    _, capture = retraining(now=lambda: clock[0], auto_retrain_min_minutes=30)
+    capture()
+    capture()
+    await until(lambda: training.commands)
+    training.release.set()
+    await until(lambda: last_result(SITE))
+    capture()
+    capture()
+    await anyio.sleep(0.05)
+    assert len(training.commands) == 1
+    clock[0] += 29 * 60
+    capture()
+    await anyio.sleep(0.05)
+    assert len(training.commands) == 1
+    clock[0] += 60
+    capture()
+    await until(lambda: len(training.commands) == 2)
+
+
+async def test_retrainer_trains_a_new_site_at_once_when_the_wait_is_for_another(
+    retraining, training
+):
+    _, capture = retraining(now=lambda: 1000.0, auto_retrain_min_minutes=30)
+    capture()
+    capture()
+    await until(lambda: training.commands)
+    training.release.set()
+    await until(lambda: last_result(SITE))
+    capture("other")
+    capture("other")
+    await until(lambda: len(training.commands) == 2)

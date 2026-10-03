@@ -185,8 +185,8 @@ _TEMPLATES = (
     _Template(
         "bug",
         "Payouts are stuck in pending",
-        "Payout {number} for {amount} EUR has been pending {when} and our sellers are waiting for"
-        " their money back.",
+        "Payout {number} for {amount} EUR has been pending {when} and our sellers are still"
+        " waiting to be paid.",
         when="span",
         incident=True,
     ),

@@ -245,22 +245,26 @@ def test_per_class_matches_an_independent_reference(predictions, label_count):
 
 
 def test_confident_errors_defaults_to_five():
-    predictions = [Prediction(0, 1, 0.5 + i / 100) for i in range(7)]
+    predictions = [Prediction(0, 1, 0.5 + i / 100, 0.5 + i / 100) for i in range(7)]
     texts = [str(i) for i in range(7)]
     assert len(confident_errors(predictions, texts)) == 5
 
 
 def test_confident_errors_orders_several_mistakes_by_confidence():
-    predictions = [Prediction(0, 1, 0.4), Prediction(0, 1, 0.9), Prediction(0, 1, 0.6)]
+    predictions = [
+        Prediction(0, 1, 0.4, 0.4),
+        Prediction(0, 1, 0.9, 0.9),
+        Prediction(0, 1, 0.6, 0.6),
+    ]
     texts = ["low", "high", "mid"]
     errors = confident_errors(predictions, texts, limit=3)
     assert [e.text for e in errors] == ["high", "mid", "low"]
-    assert errors[0] == ConfidentError("high", 0, 1, 0.9)
+    assert errors[0] == ConfidentError("high", 0, 1, 0.9, 0.9)
 
 
 def test_confident_errors_rejects_mismatched_lengths():
     with pytest.raises(ValueError, match="argument 2 is longer"):
-        confident_errors([Prediction(0, 1, 0.5)], ["a", "b"])
+        confident_errors([Prediction(0, 1, 0.5, 0.5)], ["a", "b"])
 
 
 def test_number_labels_at_the_maximum_are_still_trainable():
@@ -352,10 +356,10 @@ def test_predict_rejects_mismatched_lengths():
 
 
 def test_ece_uses_fifteen_bins_by_default():
-    predictions = [Prediction(0, 0, 0.61), Prediction(0, 1, 0.66)]
+    predictions = [Prediction(0, 0, 0.61, 0.61), Prediction(0, 1, 0.66, 0.66)]
     assert ece(predictions) == pytest.approx(reference_ece(predictions, 15), abs=1e-9)
 
 
 def test_ece_clamps_an_out_of_range_confidence_to_the_top_bin():
-    predictions = [Prediction(0, 0, 1.5), Prediction(0, 1, 14.5 / 15)]
+    predictions = [Prediction(0, 0, 1.5, 1.5), Prediction(0, 1, 14.5 / 15, 14.5 / 15)]
     assert ece(predictions) == pytest.approx(reference_ece(predictions, 15), abs=1e-9)

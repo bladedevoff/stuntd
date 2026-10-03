@@ -14,7 +14,9 @@ from stuntd.train.metrics import (
     operating_point,
     per_class,
     predict,
+    quantile,
     softmax,
+    wilson_interval,
 )
 
 
@@ -51,11 +53,11 @@ def surest_row(logits):
 
 
 CURVE = [
-    Prediction(0, 0, 0.95),
-    Prediction(0, 0, 0.9),
-    Prediction(1, 0, 0.8),
-    Prediction(1, 1, 0.7),
-    Prediction(0, 0, 0.6),
+    Prediction(0, 0, 0.95, 0.95),
+    Prediction(0, 0, 0.9, 0.9),
+    Prediction(1, 0, 0.8, 0.8),
+    Prediction(1, 1, 0.7, 0.7),
+    Prediction(0, 0, 0.6, 0.6),
 ]
 
 
@@ -100,22 +102,25 @@ def test_confidence_never_dips_below_zero():
 
 def test_predict_applies_the_temperature():
     preds = predict([[2.0, 0.0]], [1], temperature=2.0)
-    assert preds == [Prediction(1, 0, pytest.approx(confidence(softmax([1.0, 0.0]))))]
+    expected = softmax([1.0, 0.0])
+    assert preds == [
+        Prediction(1, 0, pytest.approx(confidence(expected)), pytest.approx(expected[0]))
+    ]
 
 
 def test_ece_weights_bins_by_size():
     preds = [
-        Prediction(0, 0, 0.9),
-        Prediction(0, 0, 0.9),
-        Prediction(0, 0, 0.55),
-        Prediction(0, 1, 0.55),
+        Prediction(0, 0, 0.9, 0.9),
+        Prediction(0, 0, 0.9, 0.9),
+        Prediction(0, 0, 0.55, 0.55),
+        Prediction(0, 1, 0.55, 0.55),
     ]
     assert ece(preds) == pytest.approx(0.075)
     assert ece([]) == 0.0
 
 
 def test_ece_skips_a_zero_confidence():
-    assert ece([Prediction(0, 0, 0.0)]) == 0.0
+    assert ece([Prediction(0, 0, 0.0, 0.0)]) == 0.0
 
 
 def test_operating_curve_has_one_point_per_confidence():
@@ -126,7 +131,7 @@ def test_operating_curve_has_one_point_per_confidence():
 
 
 def test_tied_confidences_stay_together():
-    points = operating_curve([Prediction(0, 0, 0.9), Prediction(0, 1, 0.9)])
+    points = operating_curve([Prediction(0, 0, 0.9, 0.9), Prediction(0, 1, 0.9, 0.9)])
     assert len(points) == 1 and points[0].coverage == 1.0 and points[0].agreement == 0.5
 
 
@@ -142,7 +147,7 @@ def test_operating_point_takes_the_widest_prefix(target, expected):
 
 
 def test_per_class_counts_support_and_agreement():
-    preds = [Prediction(0, 0, 0.9), Prediction(0, 1, 0.8), Prediction(1, 1, 0.7)]
+    preds = [Prediction(0, 0, 0.9, 0.9), Prediction(0, 1, 0.8, 0.8), Prediction(1, 1, 0.7, 0.7)]
     stats = per_class(preds, ["allow", "block", "review"])
     assert stats["allow"].support == 2 and stats["allow"].agreement == 0.5
     assert stats["block"].support == 1 and stats["block"].agreement == 1.0
@@ -162,3 +167,51 @@ def test_confident_error_text_is_cut_and_flattened():
     errors = confident_errors(CURVE, [long_text] * 5)
     assert len(errors[0].text) <= ERROR_TEXT_CHARS
     assert errors[0].text.startswith("user: spam spam")
+
+
+def test_predict_keeps_the_probability_of_the_chosen_answer():
+    preds = predict([[2.0, 0.0], [0.0, 1.0]], [0, 0], temperature=1.0)
+    assert [pred.probability for pred in preds] == [
+        pytest.approx(softmax([2.0, 0.0])[0]),
+        pytest.approx(softmax([0.0, 1.0])[1]),
+    ]
+
+
+def test_confident_errors_carry_the_probability_of_the_wrong_answer():
+    errors = confident_errors([Prediction(0, 1, 0.8, 0.9), Prediction(0, 1, 0.4, 0.6)], ["a", "b"])
+    assert [error.probability for error in errors] == [0.9, 0.6]
+
+
+@pytest.mark.parametrize(
+    ("correct", "total", "low", "high"),
+    [
+        (10, 10, 0.7225, 1.0),
+        (5, 10, 0.2366, 0.7634),
+        (0, 10, 0.0, 0.2775),
+        (95, 100, 0.8882, 0.9784),
+    ],
+    ids=["all-right", "half", "none-right", "large-sample"],
+)
+def test_wilson_interval_matches_hand_computed_values(correct, total, low, high):
+    interval = wilson_interval(correct, total)
+    assert interval.low == pytest.approx(low, abs=1e-4)
+    assert interval.high == pytest.approx(high, abs=1e-4)
+
+
+def test_wilson_interval_narrows_with_more_rows():
+    small, large = wilson_interval(9, 10), wilson_interval(900, 1000)
+    assert large.high - large.low < small.high - small.low
+
+
+@pytest.mark.parametrize(
+    ("values", "level", "expected"),
+    [
+        ([4.0, 0.0, 2.0, 1.0, 3.0], 0.95, 3.8),
+        ([4.0, 0.0, 2.0, 1.0, 3.0], 0.5, 2.0),
+        ([4.0, 0.0, 2.0, 1.0, 3.0], 1.0, 4.0),
+        ([0.7], 0.95, 0.7),
+    ],
+    ids=["interpolated", "median", "maximum", "single value"],
+)
+def test_quantile_interpolates_between_ranks(values, level, expected):
+    assert quantile(values, level) == pytest.approx(expected)

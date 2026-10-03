@@ -4,6 +4,9 @@ import argparse
 import json
 import logging
 import math
+import os
+import shutil
+import signal
 import sqlite3
 import sys
 import time
@@ -11,21 +14,25 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from stuntd.decisions.schema import DecisionSchema, detect_schema
-from stuntd.paths import private_file
+from stuntd.jev.answer import answer_label
+from stuntd.jev.schema import laya_question, typed_field
+from stuntd.paths import data_dir, private_file, write_private
 from stuntd.serve.modes import (
     MODE_CHECK,
     MODE_COLLECT,
     MODE_LIVE,
     MODE_SHADOW,
     SiteState,
+    site_state,
     site_states,
     write_mode,
 )
 from stuntd.serve.monitor import window_agreement, window_start
 from stuntd.serve.retrain import last_result
+from stuntd.serve.runtime import is_novel
 from stuntd.settings import (
     CONFIG_TEMPLATE,
     Settings,
@@ -33,8 +40,17 @@ from stuntd.settings import (
     database_path,
     load_settings,
     models_path,
+    setting_key,
 )
-from stuntd.train.artifacts import HEAD_FILE, SiteModel, list_models, load_model, site_dir
+from stuntd.train.artifacts import (
+    HEAD_FILE,
+    META_FILE,
+    SiteModel,
+    list_models,
+    load_model,
+    rename_model,
+    site_dir,
+)
 from stuntd.train.gold import GoldRow, render_gold, render_gold_json, score_gold
 from stuntd.train.report import render, render_json
 from stuntd.train.run import NO_CAPTURES, Trainer, TrainResult, train_sites
@@ -49,9 +65,13 @@ __all__ = ["main"]
 _COLUMN_WIDTHS = (18, 8, 9, 8, 6, 10)
 _CONFIG_HELP = "settings file to read instead of the one in the data directory"
 _IMPORT_MODEL = "import"
+_PID_FILE = "stuntd.pid"
 _COVERAGE_DIGITS = 2
 # Below this share of the holdout a head answers so little that the operator should hear about it.
 _LOW_COVERAGE = 0.10
+# A local Jev answers whatever the head does not with the base checkpoint, so past this share it
+# is the checkpoint that mostly answers.
+_LOW_LOCAL_COVERAGE = 0.50
 _KINDS = ("choice", "boolean", "number")
 _BOOLEAN_ANSWERS = ("true", "false")
 
@@ -61,6 +81,7 @@ class _SiteStatus:
     """One row of the status table: how a site serves and what it has answered lately."""
 
     site: str
+    name: str | None
     mode: str
     captures: int
     shadow: int
@@ -138,27 +159,51 @@ def _serve(args: argparse.Namespace) -> int:
             decider.warm_base()
     # uvicorn.run never returns while the daemon is up, so a piped stdout needs the lines now.
     listening = f"stuntd listening on http://{settings.host}:{settings.port}"
-    if settings.upstream:
-        print(f"{listening} -> {settings.upstream}", flush=True)
-    else:
-        print(listening, flush=True)
-        print("no upstream: only the Jev routes are served", flush=True)
+    print(f"{listening} -> {settings.upstream}" if settings.upstream else listening, flush=True)
+    jev = "jev proxy" if settings.jev_upstream else "jev local"
+    endpoints = [*(["openai", "anthropic"] if settings.upstream else []), jev]
+    print(f"endpoints: {', '.join(endpoints)}", flush=True)
     if decider is not None:
         served = f"{len(serving)} site(s)" if serving else "jev locally"
         loading = ", loading on first use" if settings.lazy_load else ""
         print(f"serving {served} with {settings.base_model}{loading}", flush=True)
     if not settings.learn:
         print("learning off", flush=True)
-    # The relay is byte-exact, so uvicorn must not put its own Date and Server headers next to
-    # the ones the provider sent.
-    uvicorn.run(
-        build_app(settings, decider=decider, config=_config_file(args.config)),
-        host=settings.host,
-        port=settings.port,
-        log_level="warning",
-        server_header=False,
-        date_header=False,
-    )
+    pid_file = data_dir() / _PID_FILE
+    write_private(pid_file, str(os.getpid()))
+    try:
+        # The relay is byte-exact, so uvicorn must not put its own Date and Server headers next
+        # to the ones the provider sent.
+        uvicorn.run(
+            build_app(settings, decider=decider, config=_config_file(args.config)),
+            host=settings.host,
+            port=settings.port,
+            log_level="warning",
+            server_header=False,
+            date_header=False,
+        )
+    finally:
+        pid_file.unlink(missing_ok=True)
+    return 0
+
+
+def _stop(args: argparse.Namespace) -> int:
+    pid_file = data_dir() / _PID_FILE
+    if not pid_file.is_file():
+        print("stuntd is not running", file=sys.stderr)
+        return 1
+    pid = int(pid_file.read_text(encoding="utf-8"))
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except PermissionError:
+        raise
+    except OSError:
+        # Windows reports a dead pid as a plain OSError, not ProcessLookupError.
+        pid_file.unlink(missing_ok=True)
+        print("stuntd is not running", file=sys.stderr)
+        return 1
+    pid_file.unlink(missing_ok=True)
+    print(f"stopped stuntd (pid {pid})")
     return 0
 
 
@@ -166,8 +211,11 @@ def _enable(args: argparse.Namespace) -> int:
     settings = _load(args.config, None, None)
     _require_learning(args.config, settings)
     models = models_path(settings)
-    site = _site_name(args.site)
-    model = _one_model(models, site)
+    return max(_enable_site(settings, models, model) for model in _served_models(models, args.site))
+
+
+def _enable_site(settings: Settings, models: Path, model: SiteModel) -> int:
+    site = model.site
     if model.threshold is None:
         print(
             f"stuntd: {site} never reached the target agreement on its holdout;"
@@ -186,7 +234,20 @@ def _enable(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    if coverage is not None and coverage < _LOW_COVERAGE:
+    local = not settings.upstream and not settings.jev_upstream
+    if local:
+        if (
+            coverage is not None
+            and coverage < _LOW_LOCAL_COVERAGE
+            and settings.local_fallback == "zeroshot"
+        ):
+            print(
+                f"stuntd: {site} covers {coverage:.0%} of the holdout at target"
+                f" {model.target_agreement:.2f}; the rest is answered zero-shot by the base"
+                " checkpoint",
+                file=sys.stderr,
+            )
+    elif coverage is not None and coverage < _LOW_COVERAGE:
         print(
             f"stuntd: {site} covers {coverage:.0%} of the holdout at target"
             f" {model.target_agreement:.2f}; most answers will still go to the provider",
@@ -203,10 +264,9 @@ def _disable(args: argparse.Namespace) -> int:
     settings = _load(args.config, None, None)
     _require_learning(args.config, settings)
     models = models_path(settings)
-    site = _site_name(args.site)
-    _one_model(models, site)
-    write_mode(site_dir(models, site), MODE_SHADOW, time.time())
-    print(f"{site}: {MODE_SHADOW}")
+    for model in _served_models(models, args.site):
+        write_mode(site_dir(models, model.site), MODE_SHADOW, time.time())
+        print(f"{model.site}: {MODE_SHADOW}")
     return 0
 
 
@@ -223,8 +283,8 @@ def _status(args: argparse.Namespace) -> int:
         print("no captures yet")
         return 0
     print(_row("site", "mode", "captures", "shadow", "live", "agreement", "retrain"))
-    for row in rows:
-        print(_status_line(row))
+    for line in _status_lines(rows):
+        print(line)
     return 0
 
 
@@ -255,7 +315,7 @@ def _config_show(args: argparse.Namespace) -> int:
             shown = ", ".join(settings.redaction_patterns)
         else:
             shown = "" if value is None else str(value)
-        print(f"{item.name} = {shown}  ({source})")
+        print(f"{setting_key(item.name)} = {shown}  ({source})")
     return 0
 
 
@@ -301,15 +361,17 @@ def _result_line(result: TrainResult) -> str:
 
 
 @contextmanager
-def _warnings_on_stderr() -> Iterator[None]:
+def _log_on_stderr() -> Iterator[None]:
     handler = logging.StreamHandler(sys.stderr)
-    handler.setLevel(logging.WARNING)
     handler.setFormatter(logging.Formatter("stuntd: %(message)s"))
     logger = logging.getLogger("stuntd")
+    level = logger.level
     logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
     try:
         yield
     finally:
+        logger.setLevel(level)
         logger.removeHandler(handler)
 
 
@@ -337,7 +399,7 @@ def _train(args: argparse.Namespace) -> int:
             # Building the trainer fetches the checkpoint, which is a long silent wait without
             # the line, so it waits until a site actually needs training.
             print(_base_model_line(settings), flush=True)
-            with _warnings_on_stderr():
+            with _log_on_stderr():
                 results = train_sites(store, settings, _load_trainer(settings), sites)
     finally:
         store.close()
@@ -465,19 +527,116 @@ def _import(args: argparse.Namespace) -> int:
     except _InvalidLine as exc:
         print(exc, file=sys.stderr)
         return 1
-    store = Store(
-        database_path(settings),
-        Redactor(settings.redaction_patterns, builtin=settings.redact),
-        max_rows=settings.max_rows,
-        max_age_days=settings.max_age_days,
+    redactor = Redactor(settings.redaction_patterns, builtin=settings.redact)
+    database = database_path(settings)
+    # A dry run reads the store only if there is one, so it never creates the database.
+    store = (
+        None
+        if args.dry_run and not database.exists()
+        else Store(
+            database, redactor, max_rows=settings.max_rows, max_age_days=settings.max_age_days
+        )
     )
-    # Importing the same file twice records its rows twice; training keeps the latest row per text.
     try:
+        recorded = (
+            set()
+            if store is None
+            else {(example.input_text, example.answer) for example in store.examples(site)}
+        )
+        new = []
         for capture in captures:
-            store.record(capture)
+            key = (redactor.apply(capture.input_text), capture.answer)
+            if key not in recorded:
+                recorded.add(key)
+                new.append(capture)
+        if store is not None and not args.dry_run:
+            for capture in new:
+                store.record(capture)
+    finally:
+        if store is not None:
+            store.close()
+    skipped = len(captures) - len(new)
+    if args.dry_run:
+        print(f"would import {len(new)} rows into {site}, skip {skipped} already recorded")
+    else:
+        print(f"imported {len(new)} rows into {site}, skipped {skipped} already recorded")
+    return 0
+
+
+def _confirm(question: str) -> bool:
+    try:
+        return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def _family(store: Store, models: Path, site: str) -> list[str]:
+    """The site and its field sites, as far as captures or a model folder know them."""
+    known = {info.site for info in store.sites()}
+    if models.is_dir():
+        known.update(folder.name for folder in models.iterdir() if folder.is_dir())
+    return sorted(name for name in known if name == site or name.startswith(f"{site}."))
+
+
+def _site_rm(args: argparse.Namespace) -> int:
+    from stuntd.store.db import Store
+    from stuntd.store.redact import Redactor
+
+    settings = _load(args.config, None, None)
+    _require_learning(args.config, settings)
+    models = models_path(settings)
+    site = _site_name(args.site)
+    store = Store(database_path(settings), Redactor())
+    try:
+        family = _family(store, models, site)
+        if not family:
+            raise ValueError(f"no site {site}")
+        served = next((name for name in family if site_state(models, name).mode == MODE_LIVE), None)
+        if served is not None and not args.force:
+            print(f"stuntd: {served} is served live; disable it or use --force", file=sys.stderr)
+            return 1
+        names = ", ".join(family)
+        if not args.yes and not _confirm(f"remove {names} with its captures, decisions and model?"):
+            print("stuntd: nothing removed", file=sys.stderr)
+            return 1
+        store.forget_site(site)
     finally:
         store.close()
-    print(f"imported {len(captures)} rows into {site}")
+    for name in family:
+        if site_dir(models, name).is_dir():
+            shutil.rmtree(site_dir(models, name))
+    print(f"removed {names}")
+    return 0
+
+
+def _site_rename(args: argparse.Namespace) -> int:
+    from stuntd.store.db import Store
+    from stuntd.store.redact import Redactor
+
+    settings = _load(args.config, None, None)
+    _require_learning(args.config, settings)
+    models = models_path(settings)
+    old, new = _site_name(args.old), _site_name(args.new)
+    site_dir(models, new)
+    store = Store(database_path(settings), Redactor())
+    try:
+        family = _family(store, models, old)
+        if not family:
+            raise ValueError(f"no site {old}")
+        if _family(store, models, new):
+            raise ValueError(f"site {new} already exists")
+        moved = [name for name in family if site_dir(models, name).is_dir()]
+        for name in moved:
+            rename_model(models, name, new + name.removeprefix(old))
+        try:
+            store.rename_site(old, new)
+        except Exception:
+            for name in moved:
+                rename_model(models, new + name.removeprefix(old), name)
+            raise
+    finally:
+        store.close()
+    print(f"renamed {old} to {new}")
     return 0
 
 
@@ -485,6 +644,17 @@ def _site_name(site: str) -> str:
     # A Jev question namespaced with a colon lands in a folder named with a dot, so either
     # spelling of the name reaches the same site whichever command is given it.
     return site.replace(":", ".")
+
+
+def _served_models(models: Path, name: str) -> list[SiteModel]:
+    """The model of a site, or, when the name is only the parent of field sites, theirs."""
+    site = _site_name(name)
+    if (site_dir(models, site) / META_FILE).is_file():
+        return [load_model(models, site)]
+    fields_of_parent = [model for model in list_models(models) if model.site.startswith(f"{site}.")]
+    if not fields_of_parent:
+        raise ValueError(f"no model for {site}")
+    return fields_of_parent
 
 
 def _one_model(models: Path, site: str) -> SiteModel:
@@ -516,23 +686,25 @@ def _report(args: argparse.Namespace) -> int:
     return 0
 
 
-def _teacher_answers(settings: Settings, site: str, redactor: Redactor) -> dict[str, str]:
+def _stored(settings: Settings, site: str, redactor: Redactor) -> tuple[dict[str, str], str | None]:
     from stuntd.store.db import Store
 
     database = database_path(settings)
     if not database.exists():
-        return {}
+        return {}, None
     store = Store(database, redactor)
     try:
         # Examples come oldest first, so the latest capture of a text is the one left standing.
-        return {example.input_text: example.answer for example in store.examples(site)}
+        teacher = {example.input_text: example.answer for example in store.examples(site)}
+        schema = next((info.schema_canonical for info in store.sites() if info.site == site), None)
+        return teacher, schema
     finally:
         store.close()
 
 
 def _gold_rows(
     settings: Settings, model: SiteModel, usable: list[tuple[str, str]]
-) -> list[GoldRow]:
+) -> tuple[list[GoldRow], str | None]:
     from stuntd.store.redact import Redactor
 
     try:
@@ -543,16 +715,31 @@ def _gold_rows(
         ) from exc
     # Captures are stored redacted, so a gold text is matched and asked in its redacted form.
     redactor = Redactor(settings.redaction_patterns, builtin=settings.redact)
-    teacher = _teacher_answers(settings, model.site, redactor)
+    teacher, schema = _stored(settings, model.site, redactor)
+    local_schema = None
+    if not settings.jev_upstream and schema is not None and typed_field(model.site, schema):
+        local_schema = schema
     head_path = site_dir(models_path(settings), model.site) / HEAD_FILE
     rows = []
     for text, answer in usable:
         redacted = redactor.apply(text)
         verdict = decider.decide(model, head_path, redacted)
+        zero_shot = None
+        if local_schema is not None and settings.local_fallback == "zeroshot":
+            # laya answers in its own untyped shape, which the decider passes through as object.
+            reply: Any = decider.answer(redacted, {model.site: laya_question(local_schema)})
+            zero_shot = answer_label(reply["answers"][model.site])
         rows.append(
-            GoldRow(answer, model.labels[verdict.label], verdict.confidence, teacher.get(redacted))
+            GoldRow(
+                answer,
+                model.labels[verdict.label],
+                verdict.confidence,
+                teacher.get(redacted),
+                is_novel(settings, model, verdict),
+                zero_shot,
+            )
         )
-    return rows
+    return rows, settings.local_fallback if local_schema is not None else None
 
 
 def _gold_report(settings: Settings, site: str, path: Path, as_json: bool) -> int:
@@ -563,8 +750,8 @@ def _gold_report(settings: Settings, site: str, path: Path, as_json: bool) -> in
         print(exc, file=sys.stderr)
         return 1
     usable = [(text, answer) for text, answer in gold if answer in model.labels]
-    rows = _gold_rows(settings, model, usable) if usable else []
-    score = score_gold(rows, model.threshold, len(gold) - len(usable))
+    rows, fallback = _gold_rows(settings, model, usable) if usable else ([], None)
+    score = score_gold(rows, model.threshold, len(gold) - len(usable), fallback)
     print(render_gold_json(model, score) if as_json else render_gold(model, score))
     return 0
 
@@ -583,11 +770,15 @@ def _row(
     return "".join(f"{value:<{width - 1}} " for value, width in columns) + str(retrain)
 
 
-def _status_line(row: _SiteStatus) -> str:
+def _label(site: str, name: str | None) -> str:
+    return f"{site} ({name})" if name else site
+
+
+def _status_line(row: _SiteStatus, label: str) -> str:
     # A site with no model has nothing to compare or to serve, which is not the same as none yet.
     served = row.mode != MODE_COLLECT
     return _row(
-        row.site,
+        label,
         row.mode,
         row.captures,
         row.shadow if served else "-",
@@ -595,6 +786,24 @@ def _status_line(row: _SiteStatus) -> str:
         "-" if row.agreement is None else f"{row.agreement:.3f}",
         row.retrain or "-",
     )
+
+
+def _status_lines(rows: list[_SiteStatus]) -> list[str]:
+    groups: dict[str, list[_SiteStatus]] = {}
+    for row in rows:
+        groups.setdefault(row.site.partition(".")[0], []).append(row)
+    lines = []
+    for parent, members in groups.items():
+        own = members[0] if members[0].site == parent else None
+        fields_of_parent = members[1:] if own else members
+        if own:
+            lines.append(_status_line(own, _label(parent, own.name)))
+        else:
+            lines.append(_row(_label(parent, members[0].name), "", "", "", "", "", "").rstrip())
+        lines.extend(
+            _status_line(row, f"  {row.site.removeprefix(parent)}") for row in fields_of_parent
+        )
+    return lines
 
 
 def _compared(counts: dict[str, int]) -> int:
@@ -609,8 +818,14 @@ def _agreement(store: Store, site: str, state: SiteState | None, window: int) ->
     return window_agreement(rows, state.model.threshold).agreement
 
 
+def _mode_label(state: SiteState | None) -> str:
+    if state is None:
+        return MODE_COLLECT
+    return f"{state.mode} (retrained, was live)" if state.was_live else state.mode
+
+
 def _row_without_captures(state: SiteState) -> _SiteStatus:
-    return _SiteStatus(state.site, state.mode, 0, 0, 0, None, last_result(state.site))
+    return _SiteStatus(state.site, None, _mode_label(state), 0, 0, 0, None, last_result(state.site))
 
 
 def _status_rows(settings: Settings) -> list[_SiteStatus]:
@@ -624,17 +839,19 @@ def _status_rows(settings: Settings) -> list[_SiteStatus]:
         return [_row_without_captures(state) for state in states.values()]
     store = Store(database, Redactor())
     try:
-        captures = {info.site: info.count for info in store.sites()}
+        infos = {info.site: info for info in store.sites()}
         counts = store.decision_counts()
         rows = []
-        for site in sorted(set(captures) | set(states)):
+        for site in sorted(set(infos) | set(states)):
             state = states.get(site)
             decisions = counts.get(site, {})
+            info = infos.get(site)
             rows.append(
                 _SiteStatus(
                     site=site,
-                    mode=MODE_COLLECT if state is None else state.mode,
-                    captures=captures.get(site, 0),
+                    name=None if info is None else info.name,
+                    mode=_mode_label(state),
+                    captures=0 if info is None else info.count,
                     shadow=_compared(decisions),
                     live=decisions.get(MODE_LIVE, 0),
                     agreement=_agreement(store, site, state, settings.window),
@@ -675,6 +892,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--lazy", action="store_true", help="load the base checkpoint on the first request"
     )
     serve.set_defaults(handler=_serve)
+
+    stop = commands.add_parser("stop", help="stop the daemon started by serve")
+    stop.set_defaults(handler=_stop)
 
     status = commands.add_parser("status", help="summarise the captures recorded so far")
     status.add_argument("--config", metavar="PATH", help=_CONFIG_HELP)
@@ -737,8 +957,32 @@ def _build_parser() -> argparse.ArgumentParser:
     importer.add_argument(
         "--labels", metavar="A,B,C", help="answers a choice site may carry, instead of --schema"
     )
+    importer.add_argument(
+        "--dry-run", action="store_true", help="count the rows to record without recording them"
+    )
     importer.add_argument("--config", metavar="PATH", help=_CONFIG_HELP)
     importer.set_defaults(handler=_import)
+
+    site = commands.add_parser("site", help="remove or rename a decision site")
+    site_commands = site.add_subparsers(dest="site_command", required=True)
+
+    remove = site_commands.add_parser(
+        "rm", help="delete a site's captures, decisions and model, and its field sites'"
+    )
+    remove.add_argument("site", metavar="SITE", help="site to remove")
+    remove.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    remove.add_argument("--force", action="store_true", help="remove a site that is served live")
+    remove.add_argument("--config", metavar="PATH", help=_CONFIG_HELP)
+    remove.set_defaults(handler=_site_rm)
+
+    rename = site_commands.add_parser(
+        "rename",
+        help="rename a site and its field sites; requests for the old name land on the new one",
+    )
+    rename.add_argument("old", metavar="OLD", help="site to rename")
+    rename.add_argument("new", metavar="NEW", help="name to give it")
+    rename.add_argument("--config", metavar="PATH", help=_CONFIG_HELP)
+    rename.set_defaults(handler=_site_rename)
 
     config = commands.add_parser("config", help="create or inspect the settings file")
     config_commands = config.add_subparsers(dest="config_command", required=True)

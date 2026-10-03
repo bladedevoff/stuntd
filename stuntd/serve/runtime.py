@@ -38,11 +38,12 @@ from stuntd.train.artifacts import HEAD_FILE, META_FILE, SiteModel, site_dir
 if TYPE_CHECKING:
     from stuntd.serve.decider import Verdict
 
-__all__ = ["DeciderLike", "Outcome", "Runtime", "input_hash"]
+__all__ = ["DeciderLike", "Outcome", "Runtime", "input_hash", "is_novel"]
 
 _log = logging.getLogger(__name__)
 
 _LOW_CONFIDENCE = "low-confidence"
+_NOVEL = "novel"
 _NO_RUNTIME = "no-runtime"
 _MODEL_ERROR = "model-error"
 _STATE_ERROR = "state-error"
@@ -130,6 +131,8 @@ class Runtime:
             return SiteState(site, MODE_COLLECT, None, None)
         self._unreadable.discard(site)
         self._states[site] = (stamps, state)
+        if state.was_live:
+            _log.warning("%s was retrained while live and is back in shadow", site)
         return state
 
     def state_reason(self, site: str) -> str | None:
@@ -138,28 +141,21 @@ class Runtime:
 
     async def shadow(self, state: SiteState, text: str, big_answer: str) -> None:
         """Runs the model beside the provider and records whether the two agreed."""
-        if self._decider is None or state.model is None:
-            return
-        try:
-            verdict = await self._decide(self._decider, state.model, text)
-            answer = state.model.labels[verdict.label]
-            self._record(
-                state,
-                "shadow",
-                answer,
-                verdict.confidence,
-                answer == big_answer,
-                verdict.latency_ms,
-            )
+        if await self._compare_beside(state, "shadow", text, big_answer):
             self.promote_if_allowed(state)
-        except (RuntimeError, sqlite3.Error):
-            # The caller already has the provider's answer, so a shadow failure has nothing left
-            # to fail: raising here would only break a connection that is already served.
-            _log.exception("shadow decision failed")
 
-    async def live(self, state: SiteState, text: str, check: bool = True) -> Outcome:
+    async def watch(self, state: SiteState, text: str, big_answer: str) -> None:
+        """Compares a live site with the provider's answer to a request it did not answer itself,
+        so its agreement keeps moving and a falling one still demotes it."""
+        if await self._compare_beside(state, "check", text, big_answer):
+            self.demote_if_needed(state)
+
+    async def live(
+        self, state: SiteState, text: str, check: bool = True, gated: bool = True
+    ) -> Outcome:
         """Answers one request from the site's own model, or says why the provider must; with
-        check off no request is sampled for comparison, because nothing can answer it instead."""
+        check off no request is sampled for comparison, because nothing can answer it instead,
+        and with gated off the model answers even a request it is unsure of or has not seen."""
         model = state.model
         if model is None or model.threshold is None:
             return Outcome(MODE_COLLECT, _LOW_CONFIDENCE, None, None, None)
@@ -189,7 +185,16 @@ class Runtime:
             # that moment came from weights the site no longer serves with.
             return Outcome(MODE_COLLECT, _RETRAINED, None, None, None)
         answer = model.labels[verdict.label]
-        if verdict.confidence < model.threshold:
+        if gated and is_novel(self._settings, model, verdict):
+            return Outcome(
+                MODE_COLLECT,
+                _NOVEL,
+                answer,
+                verdict.confidence,
+                verdict.latency_ms,
+                verdict.probabilities,
+            )
+        if gated and verdict.confidence < model.threshold:
             return Outcome(
                 MODE_COLLECT,
                 _LOW_CONFIDENCE,
@@ -207,7 +212,8 @@ class Runtime:
                 verdict.latency_ms,
                 verdict.probabilities,
             )
-        self._remember(key, verdict)
+        if gated:
+            self._remember(key, verdict)
         return Outcome(
             MODE_LIVE, None, answer, verdict.confidence, verdict.latency_ms, verdict.probabilities
         )
@@ -317,6 +323,24 @@ class Runtime:
         )
         return True
 
+    async def _compare_beside(
+        self, state: SiteState, mode: _DecisionMode, text: str, big_answer: str
+    ) -> bool:
+        if self._decider is None or state.model is None:
+            return False
+        try:
+            verdict = await self._decide(self._decider, state.model, text)
+            answer = state.model.labels[verdict.label]
+            self._record(
+                state, mode, answer, verdict.confidence, answer == big_answer, verdict.latency_ms
+            )
+        except (RuntimeError, sqlite3.Error):
+            # The caller already has the provider's answer, so a failed comparison has nothing
+            # left to fail: raising here would only break a connection that is already served.
+            _log.exception("%s decision failed", mode)
+            return False
+        return True
+
     async def _decide(self, decider: DeciderLike, model: SiteModel, text: str) -> Verdict:
         head_path = site_dir(self._models, model.site) / HEAD_FILE
         # Captures are stored redacted, so the head learned redacted text; the cache and the
@@ -366,6 +390,17 @@ class Runtime:
 def input_hash(site: str, text: str) -> str:
     """Names one request of one site: the cache key, the check sample and the answer's id."""
     return hashlib.sha256(f"{site}\n{text}".encode()).hexdigest()
+
+
+def is_novel(settings: Settings, model: SiteModel, verdict: Verdict) -> bool:
+    """Whether the novelty gate would stop a request: it is farther from the rows the head
+    trained on than the head's cut-off, and the gate is on."""
+    return (
+        settings.novelty_gate
+        and verdict.novelty is not None
+        and model.novelty_cutoff is not None
+        and verdict.novelty > model.novelty_cutoff
+    )
 
 
 def _stamp(path: Path) -> _Stamp | None:

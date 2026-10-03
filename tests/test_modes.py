@@ -9,6 +9,7 @@ from stuntd.serve.modes import (
     MODE_LIVE,
     MODE_SHADOW,
     read_mode,
+    read_was_live,
     site_state,
     site_states,
     write_mode,
@@ -53,6 +54,22 @@ def test_mode_round_trip(tmp_path):
         "mode": "live",
         "changed_at": 42.0,
     }
+
+
+def test_was_live_is_recorded_beside_the_mode(tmp_path):
+    folder = save_model(tmp_path, model())
+    assert not read_was_live(folder)
+    write_mode(folder, MODE_SHADOW, now=1.0, was_live=True)
+    assert read_was_live(folder)
+    assert read_mode(folder) == (MODE_SHADOW, 1.0)
+    write_mode(folder, MODE_LIVE, now=2.0)
+    assert not read_was_live(folder)
+
+
+def test_site_state_carries_was_live(tmp_path):
+    folder = save_model(tmp_path, model())
+    write_mode(folder, MODE_SHADOW, now=1.0, was_live=True)
+    assert site_state(tmp_path, "s1").was_live
 
 
 def refuse_replace(*args, **kwargs):

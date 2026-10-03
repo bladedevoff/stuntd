@@ -8,6 +8,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
 
+from stuntd.cli import main
 from stuntd.decisions.schema import detect_schema
 from stuntd.decisions.site import site_key
 from stuntd.proxy.app import build_app
@@ -154,6 +155,30 @@ async def test_untyped_chat_request_is_not_recorded(proxy):
         json={"model": "gpt-x", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert r.headers["x-stuntd"] == "passthrough; reason=no-schema"
+    assert app.state.store.stats() == []
+
+
+@pytest.mark.parametrize(
+    "properties",
+    [
+        {"note": {"type": "string"}},
+        {"items": {"type": "array", "items": {"type": "string"}}},
+        {"inner": {"type": "object", "properties": {"a": {"type": "boolean"}}}},
+        {f"f{n}": {"type": "boolean"} for n in range(9)},
+    ],
+    ids=["free-text", "array", "nested-object", "nine-fields"],
+)
+async def test_unsupported_schema_is_passed_through_with_its_reason(proxy, properties):
+    client, app = proxy
+    request = {
+        **MOD_REQUEST,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "x", "schema": {"type": "object", "properties": properties}},
+        },
+    }
+    r = await client.post("/v1/chat/completions", json=request)
+    assert r.headers["x-stuntd"] == "passthrough; reason=unsupported-schema"
     assert app.state.store.stats() == []
 
 
@@ -361,3 +386,28 @@ async def test_upstream_stuntd_header_is_replaced_on_the_decision_path(data_dir)
 )
 def test_usage_tokens_keeps_only_integer_counts(response_json, expected):
     assert usage_tokens(response_json) == expected
+
+
+async def test_the_schema_name_is_recorded_with_the_capture(proxy):
+    client, app = proxy
+    await client.post("/v1/chat/completions", json=MOD_REQUEST)
+    assert [info.name for info in app.state.store.sites()] == ["mod"]
+
+
+async def sites_after_a_moderation_request():
+    app = build_app(Settings(upstream="http://upstream"), transport=httpx.ASGITransport(app=fake))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as c:
+        await c.post("/v1/chat/completions", json=MOD_REQUEST)
+    sites = [(info.site, info.count) for info in app.state.store.sites()]
+    await app.state.client.aclose()
+    app.state.store.close()
+    return sites
+
+
+async def test_a_renamed_site_keeps_receiving_its_computed_key_across_a_restart(data_dir):
+    computed = site_key(detect_schema(MOD_REQUEST), "Moderate.")
+    assert await sites_after_a_moderation_request() == [(computed, 1)]
+    assert main(["site", "rename", computed, "moderation"]) == 0
+    assert await sites_after_a_moderation_request() == [("moderation", 2)]

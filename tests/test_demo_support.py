@@ -85,6 +85,17 @@ def test_the_rule_teacher_reads_the_words_of_the_ticket(body, urgency, needs_hum
     assert support.needs_human(ticket) == needs_human
 
 
+def test_a_stuck_payout_without_an_outage_does_not_need_a_human():
+    payouts = [
+        ticket
+        for ticket in support.tickets(1, 3000)
+        if ticket.template.subject == "Payouts are stuck in pending"
+        and support.urgency(ticket) != "3"
+    ]
+    assert payouts
+    assert {support.needs_human(ticket) for ticket in payouts} == {"false"}
+
+
 def test_the_client_skips_the_states_it_was_trained_on(tmp_path):
     assert support.main(["--rows", "40", "--seed", "1", "--out", str(tmp_path)]) == 0
     trained = client.trained_texts(tmp_path)

@@ -11,12 +11,15 @@ __all__ = ["GoldRow", "GoldScore", "render_gold", "render_gold_json", "score_gol
 
 @dataclass(frozen=True)
 class GoldRow:
-    """One verified row: the gold answer, the head's answer and confidence, the teacher's if stored."""
+    """One verified row: the gold answer, the head's answer and confidence, the teacher's if stored,
+    whether the novelty gate stops the head, and the zero-shot answer of a local Jev."""
 
     gold: str
     head: str
     confidence: float
     teacher: str | None
+    novel: bool = False
+    zero_shot: str | None = None
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,7 @@ class GoldScore:
     unseen_head_accuracy: float | None
     served_accuracy: float | None
     local_share: float | None
+    fallback: str | None
     unserved: int
     teacher_rows: int
     teacher_accuracy: float | None
@@ -44,14 +48,21 @@ def _rate(hits: int, total: int) -> float | None:
     return hits / total if total else None
 
 
-def score_gold(rows: Sequence[GoldRow], threshold: float | None, skipped: int) -> GoldScore:
-    """Scores the rows a site's head answered against their gold answers."""
+def score_gold(
+    rows: Sequence[GoldRow], threshold: float | None, skipped: int, fallback: str | None = None
+) -> GoldScore:
+    """Scores the rows a site's head answered against their gold answers; fallback names what a
+    local Jev answers the rest with, zeroshot or head, and None means the provider does."""
     local = served = served_right = 0
     for row in rows:
-        # A site without a threshold never lets its head answer, so the teacher serves every row.
-        if threshold is not None and row.confidence >= threshold:
+        # A site without a threshold never lets its head answer, so the fallback serves every row.
+        if threshold is not None and row.confidence >= threshold and not row.novel:
             local += 1
             answer: str | None = row.head
+        elif fallback == "head":
+            answer = row.head
+        elif fallback == "zeroshot":
+            answer = row.zero_shot
         else:
             answer = row.teacher
         if answer is not None:
@@ -71,6 +82,7 @@ def score_gold(rows: Sequence[GoldRow], threshold: float | None, skipped: int) -
         unseen_head_accuracy=_rate(sum(row.head == row.gold for row in unseen), len(unseen)),
         served_accuracy=_rate(served_right, served),
         local_share=_rate(local, len(rows)),
+        fallback=fallback,
         unserved=len(rows) - served,
         teacher_rows=len(pairs),
         teacher_accuracy=_rate(sum(teacher for _, teacher in pairs), len(pairs)),
@@ -87,11 +99,13 @@ def _shown(value: float | None) -> str:
 
 def render_gold(model: SiteModel, score: GoldScore) -> str:
     """One site's gold score as the block of text the report command prints."""
-    if model.threshold is None:
-        at, unserved = "no threshold", f"{score.unserved} with no teacher answer"
+    at = "no threshold" if model.threshold is None else f"threshold {model.threshold:.2f}"
+    if score.fallback is not None:
+        answered, unserved = "by the head", f"the rest by the {score.fallback} fallback"
+    elif model.threshold is None:
+        answered, unserved = "locally", f"{score.unserved} with no teacher answer"
     else:
-        at = f"threshold {model.threshold:.2f}"
-        unserved = f"{score.unserved} below it with no teacher answer"
+        answered, unserved = "locally", f"{score.unserved} below it with no teacher answer"
     local = "-" if score.local_share is None else f"{score.local_share:.0%}"
     return "\n".join(
         [
@@ -99,7 +113,7 @@ def render_gold(model: SiteModel, score: GoldScore) -> str:
             f"head accuracy {_shown(score.head_accuracy)}",
             f"head accuracy {_shown(score.unseen_head_accuracy)} on {score.unseen_rows} rows"
             " the store has not seen",
-            f"served accuracy {_shown(score.served_accuracy)} at {at}: {local} answered locally,"
+            f"served accuracy {_shown(score.served_accuracy)} at {at}: {local} answered {answered},"
             f" {unserved}",
             f"teacher accuracy {_shown(score.teacher_accuracy)} on {score.teacher_rows} rows",
             f"head and teacher: both right {score.both_right}, both wrong {score.both_wrong},"

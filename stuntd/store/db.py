@@ -23,7 +23,8 @@ create table if not exists captures (
     latency_ms integer not null,
     prompt_tokens integer,
     completion_tokens integer,
-    created_at real not null
+    created_at real not null,
+    schema_name text
 );
 create index if not exists captures_site_time on captures(site, created_at);
 create index if not exists captures_created on captures(created_at);
@@ -38,11 +39,16 @@ create table if not exists decisions (
     created_at real not null
 );
 create index if not exists decisions_site_time on decisions(site, created_at);
+create table if not exists aliases (
+    old text primary key,
+    new text not null
+);
 """
 
 _INSERT = (
     "insert into captures (site, schema_canonical, kind, input_text, answer, model,"
-    " latency_ms, prompt_tokens, completion_tokens, created_at) values (?,?,?,?,?,?,?,?,?,?)"
+    " latency_ms, prompt_tokens, completion_tokens, created_at, schema_name)"
+    " values (?,?,?,?,?,?,?,?,?,?,?)"
 )
 
 _INSERT_DECISION = (
@@ -67,12 +73,23 @@ _EXAMPLES = (
     "select input_text, answer, created_at from captures where site = ? order by created_at, id"
 )
 
-_CAPTURES_SINCE = "select count(*) from captures where site = ? and created_at > ?"
+_TEXTS_SINCE = "select distinct input_text from captures where site = ? and created_at > ?"
 
 _SITES = (
-    "select latest.site, captures.kind, captures.schema_canonical, latest.total from"
+    "select latest.site, captures.kind, captures.schema_canonical, latest.total,"
+    " captures.schema_name from"
     " (select site, count(*) as total, max(id) as last_id from captures group by site) as latest"
     " join captures on captures.id = latest.last_id order by latest.site"
+)
+
+# A site and the field sites named after it: "?" is the site, then the prefix length and prefix.
+_IN_FAMILY = "(site = ? or substr(site, 1, ?) = ?)"
+
+_FORGET = tuple(f"delete from {table} where {_IN_FAMILY}" for table in ("captures", "decisions"))
+
+_RENAME = tuple(
+    f"update {table} set site = ? || substr(site, ?) where {_IN_FAMILY}"
+    for table in ("captures", "decisions")
 )
 
 _MODES = (MODE_SHADOW, MODE_CHECK, MODE_LIVE)
@@ -96,6 +113,7 @@ class Capture:
     latency_ms: int
     prompt_tokens: int | None
     completion_tokens: int | None
+    schema_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +147,7 @@ class SiteInfo:
     kind: str
     schema_canonical: str
     count: int
+    name: str | None
 
 
 class Store:
@@ -146,6 +165,9 @@ class Store:
         self._conn = sqlite3.connect(path)
         try:
             self._conn.executescript(_SCHEMA)
+            columns = {row[1] for row in self._conn.execute("pragma table_info(captures)")}
+            if "schema_name" not in columns:
+                self._conn.execute("alter table captures add column schema_name text")
         except sqlite3.DatabaseError:
             # A file that is not a database leaves the caller with no Store to close.
             self._conn.close()
@@ -177,6 +199,7 @@ class Store:
                 capture.prompt_tokens,
                 capture.completion_tokens,
                 time.time(),
+                capture.schema_name,
             ),
         )
         self._count_and_commit()
@@ -228,8 +251,8 @@ class Store:
         rows = self._conn.execute(_EXAMPLES, (site,)).fetchall()
         return [Example(text, answer, created_at) for text, answer, created_at in rows]
 
-    def captures_since(self, site: str, since: float) -> int:
-        return int(self._conn.execute(_CAPTURES_SINCE, (site, since)).fetchone()[0])
+    def texts_since(self, site: str, since: float) -> list[str]:
+        return [text for (text,) in self._conn.execute(_TEXTS_SINCE, (site, since))]
 
     def decisions(self, site: str, limit: int) -> list[Decision]:
         _check_limit(limit)
@@ -265,7 +288,32 @@ class Store:
 
     def sites(self) -> list[SiteInfo]:
         rows = self._conn.execute(_SITES).fetchall()
-        return [SiteInfo(site, kind, schema, count) for site, kind, schema, count in rows]
+        return [
+            SiteInfo(site, kind, schema, count, name) for site, kind, schema, count, name in rows
+        ]
+
+    def forget_site(self, site: str) -> None:
+        """Deletes the captures and decisions of a site and of its field sites, and its aliases."""
+        family = (site, len(site) + 1, f"{site}.")
+        for statement in _FORGET:
+            self._conn.execute(statement, family)
+        self._conn.execute("delete from aliases where old = ? or new = ?", (site, site))
+        self._conn.commit()
+
+    def rename_site(self, old: str, new: str) -> None:
+        """Moves a site and its field sites to a new name, which then answers for the old one."""
+        family = (new, len(old) + 1, old, len(old) + 1, f"{old}.")
+        for statement in _RENAME:
+            self._conn.execute(statement, family)
+        self._conn.execute("delete from aliases where old = ?", (new,))
+        self._conn.execute("update aliases set new = ? where new = ?", (new, old))
+        self._conn.execute("insert or replace into aliases (old, new) values (?, ?)", (old, new))
+        self._conn.commit()
+
+    def resolve(self, site: str) -> str:
+        """The name a site answers to now: the one it was renamed to, or itself."""
+        row = self._conn.execute("select new from aliases where old = ?", (site,)).fetchone()
+        return site if row is None else row[0]
 
     def stats(self) -> list[dict[str, str | int | float]]:
         rows = self._conn.execute(
