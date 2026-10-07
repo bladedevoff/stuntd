@@ -18,6 +18,7 @@ __all__ = [
     "PLANS",
     "SITES",
     "STUCK_CUES",
+    "TEMPLATES",
     "URGENCY_LEVELS",
     "Ticket",
     "category",
@@ -26,6 +27,7 @@ __all__ = [
     "state_text",
     "tickets",
     "urgency",
+    "write_rows",
 ]
 
 CATEGORIES = ("billing", "bug", "feature", "account", "other")
@@ -135,7 +137,7 @@ class _Template:
     incident: bool = False
 
 
-_TEMPLATES = (
+TEMPLATES = (
     _Template(
         "billing",
         "Charged twice for invoice {number}",
@@ -256,6 +258,7 @@ _TEMPLATES = (
         "Procurement needs the questionnaire back before the {amount} EUR renewal.",
     ),
 )
+"""The 20 templates a ticket is drawn from."""
 
 
 @dataclass(frozen=True)
@@ -330,15 +333,16 @@ SITES = {"category": category, "urgency": urgency, "needs_human": needs_human}
 """The site each question is imported into and the rule that labels its rows."""
 
 
-def tickets(seed: int, count: int) -> list[Ticket]:
-    """Draws count tickets whose states are all different, the same ones for the same seed."""
+def tickets(seed: int, count: int, templates: tuple[_Template, ...] = TEMPLATES) -> list[Ticket]:
+    """Draws count tickets from the templates whose states are all different, the same ones for
+    the same seed."""
     rng = random.Random(seed)
     seen: set[str] = set()
     drawn: list[Ticket] = []
     for _ in range(count * _DRAWS_PER_TICKET):
         if len(drawn) == count:
             return drawn
-        ticket = _draw(rng)
+        ticket = _draw(rng, templates)
         text = state_text(ticket)
         if text not in seen:
             seen.add(text)
@@ -362,8 +366,8 @@ def _clauses(rng: random.Random, template: _Template) -> tuple[str, str]:
     return "", rng.choice(rng.choice((_DEADLINE, _CALM)))
 
 
-def _draw(rng: random.Random) -> Ticket:
-    template = rng.choice(_TEMPLATES)
+def _draw(rng: random.Random, templates: tuple[_Template, ...]) -> Ticket:
+    template = rng.choice(templates)
     impact, tail = _clauses(rng, template)
     when = _WHEN[template.when]
     return Ticket(
@@ -382,8 +386,12 @@ def _draw(rng: random.Random) -> Ticket:
 def main(argv: list[str] | None = None) -> int:
     """Writes one JSONL file per site into the output directory."""
     args = _parser().parse_args(argv)
-    drawn = tickets(args.seed, args.rows)
-    out = Path(args.out)
+    write_rows(tickets(args.seed, args.rows), Path(args.out))
+    return 0
+
+
+def write_rows(drawn: list[Ticket], out: Path) -> None:
+    """Writes one JSONL file per site into out, a row for each ticket."""
     out.mkdir(parents=True, exist_ok=True)
     for site, teacher in SITES.items():
         path = out / f"{site}.jsonl"
@@ -392,7 +400,6 @@ def main(argv: list[str] | None = None) -> int:
                 row = {"text": state_text(ticket), "answer": teacher(ticket)}
                 rows.write(json.dumps(row, ensure_ascii=False) + "\n")
         print(f"wrote {len(drawn)} rows to {path}")
-    return 0
 
 
 def _parser() -> argparse.ArgumentParser:

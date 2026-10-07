@@ -74,7 +74,7 @@ CONFIG_TEMPLATE = """# stuntd settings. Every key is optional; a missing key kee
 # Minutes a site waits after one automatic run before the daemon may start the next; 0 is no wait.
 # auto_retrain_min_minutes = 30
 # Share of the holdout's novelty a head treats as familiar: its novelty cut-off is this quantile.
-# novelty_quantile = 0.95
+# novelty_quantile = 0.99
 
 [serving]
 # Share of the requests a serving site still sends to the provider to check its own answer.
@@ -224,7 +224,7 @@ class Settings:
     auto_retrain_min_minutes: int = 30
     """Minutes a site waits after one automatic run before the next may start; 0 is no wait."""
 
-    novelty_quantile: float = 0.95
+    novelty_quantile: float = 0.99
     """Quantile of the holdout's novelty that becomes a head's novelty cut-off."""
 
     check_share: float = 0.02

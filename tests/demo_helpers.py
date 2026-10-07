@@ -12,19 +12,21 @@ TypeSafeClient = typesafe_sdk.TypeSafeClient
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 
 
-def load_demo(name):
+def load_demo(name, script="client"):
     directory = EXAMPLES / name
-    generate = _load(f"{name}_generate", directory / "generate.py")
+    generate = sys.modules.get(f"{name}_generate") or _load(
+        f"{name}_generate", directory / "generate.py"
+    )
     kept = sys.modules.get("generate")
     sys.modules["generate"] = generate
     try:
-        client = _load(f"{name}_client", directory / "client.py")
+        loaded = _load(f"{name}_{script}", directory / f"{script}.py")
     finally:
         if kept is None:
             del sys.modules["generate"]
         else:
             sys.modules["generate"] = kept
-    return generate, client
+    return generate, loaded
 
 
 def recording_transport(answers):

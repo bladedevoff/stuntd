@@ -320,6 +320,8 @@ class JevRoutes:
         try:
             for capture in captures:
                 store.record(capture)
+                if self._proxy.retrainer is not None:
+                    self._proxy.retrainer.record(capture.site, capture.input_text)
         except sqlite3.Error:
             # The provider has already produced and billed these answers, so a database that
             # cannot take them must still not cost the caller the answer.

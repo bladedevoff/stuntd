@@ -368,7 +368,7 @@ def test_template_documents_jev():
 
 @pytest.mark.parametrize(
     ("line", "expected"),
-    [("", 0.95), ("novelty_quantile = 0.9\n", 0.9), ("novelty_quantile = 1.0\n", 1.0)],
+    [("", 0.99), ("novelty_quantile = 0.9\n", 0.9), ("novelty_quantile = 1.0\n", 1.0)],
     ids=["default", "custom", "maximum"],
 )
 def test_novelty_quantile_comes_from_the_file(tmp_path, line, expected):

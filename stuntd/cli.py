@@ -578,6 +578,13 @@ def _family(store: Store, models: Path, site: str) -> list[str]:
     return sorted(name for name in known if name == site or name.startswith(f"{site}."))
 
 
+def _is_live(models: Path, site: str) -> bool:
+    try:
+        return site_state(models, site).mode == MODE_LIVE
+    except ValueError:
+        return False
+
+
 def _site_rm(args: argparse.Namespace) -> int:
     from stuntd.store.db import Store
     from stuntd.store.redact import Redactor
@@ -591,7 +598,7 @@ def _site_rm(args: argparse.Namespace) -> int:
         family = _family(store, models, site)
         if not family:
             raise ValueError(f"no site {site}")
-        served = next((name for name in family if site_state(models, name).mode == MODE_LIVE), None)
+        served = next((name for name in family if _is_live(models, name)), None)
         if served is not None and not args.force:
             print(f"stuntd: {served} is served live; disable it or use --force", file=sys.stderr)
             return 1
@@ -727,8 +734,12 @@ def _gold_rows(
         zero_shot = None
         if local_schema is not None and settings.local_fallback == "zeroshot":
             # laya answers in its own untyped shape, which the decider passes through as object.
-            reply: Any = decider.answer(redacted, {model.site: laya_question(local_schema)})
-            zero_shot = answer_label(reply["answers"][model.site])
+            try:
+                reply: Any = decider.answer(redacted, {model.site: laya_question(local_schema)})
+            except RuntimeError as exc:
+                print(f"stuntd: zero-shot failed: {exc}", file=sys.stderr)
+            else:
+                zero_shot = answer_label(reply["answers"][model.site])
         rows.append(
             GoldRow(
                 answer,

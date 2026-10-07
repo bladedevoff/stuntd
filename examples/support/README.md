@@ -104,9 +104,10 @@ RTX 5060, with `convaiinnovations/laya` as the base checkpoint. `stuntd report`:
 | `needs_human` | 0.970 | 0.079 | coverage 0.94 at agreement 0.991 |
 | `urgency` | 0.922 | 0.092 | coverage 0.73 at agreement 0.991 |
 
-Then 200 tickets no training row contained, before and after `stuntd enable`. These two runs
-were measured before the novelty gate existed; with the gate on, the share answered by a head is
-lower (see the gate numbers below):
+Then 200 tickets no training row contained, before and after `stuntd enable`. These two runs, and
+the 266 s above, were measured with 0.1.3 before the novelty gate existed and were not repeated for
+0.1.4; `check.py` does not reproduce them. With the gate on, the share answered by a head is lower
+(see the gate numbers below):
 
 | run | category | urgency | needs_human | p50 per request | answered by a head |
 | --- | --- | --- | --- | --- | --- |
@@ -139,25 +140,78 @@ measures new wording of known tickets, not new kinds of ticket. Two checks say m
 | check | all three heads sure | all three right when sure |
 | --- | --- | --- |
 | new states of the 20 trained templates | 72.3% | 97.2% |
-| one template per category left out of training, tested on those five | 40.0% | 61.0% |
+| one template per category left out of training, tested on those five | 68.7% | 42.4% |
 
-On the left-out templates `category` was sure on 71.5% and right on 87.8% of those, `urgency` on
-60.2% and 81.7%, `needs_human` on 94.4% and 89.0%. These numbers move far more between runs than
-the ones above: an earlier run of the same check had `category` sure on every ticket and right on
-two thirds. Changing only `channel` and `plan`, which no rule reads, changes the answer of
+The left-out row moves far more between draws of the training rows than the others, because a head
+that has never seen a template guesses: an earlier measurement of the same check, on another draw,
+had 40.0% and 61.0%. Changing only `channel` and `plan`, which no rule reads, changes the answer of
 `category` on 2.1% of the tickets, `needs_human` on 3.5% and `urgency` on 10.2%.
 
-**The novelty gate.** `serving.novelty_gate` is on by default, and these checks were repeated with
-it. With one template per category held out (heads trained on 3,000 rows of the other 15
-templates), the gate stopped all 1,000 tickets from the held-out templates; without it all three
-heads were sure on 40.0% and all three right on 61.0% of those. On 1,000 unseen states of the 15
-trained templates (seed 10001), 76.6% were answered locally without the gate and 70.6% with it,
-and all three were right on 97.4% and 97.7% of the local ones. The heads trained on all 20
-templates answered 72.3% of the unseen states locally without the gate and 66.9% with it, and the
-gate stopped 8.1% of them. "What's the weather in Paris", `asdf qwer zxcv` and an empty state were
-stopped on all three heads. The main README's [novelty gate](../../README.md#the-novelty-gate)
+**The novelty gate.** `serving.novelty_gate` is on by default, with each head's cut-off at the 0.99
+quantile of its holdout's novelty. With one template per category held out (heads trained on 3,000
+rows of the other 15 templates), the gate let 0.3% of the 1,000 tickets from the held-out templates
+be answered locally, against 68.7% without it; at the 0.95 and 0.98 quantiles it let none through.
+On 1,000 unseen states of the 15 trained templates (seed 10001), 88.8% were answered locally
+without the gate and 85.8% with it, and all three were right on 97.2% and 97.3% of the local ones.
+The heads trained on all 20 templates answered 72.3% of the unseen states locally without the gate
+and 70.6% with it, and all three were right on 97.2% in both cases. "What's the weather in Paris",
+`asdf qwer zxcv` and an empty state were stopped on all three heads at every quantile; without
+the gate none of them was. The main README's [novelty gate](../../README.md#the-novelty-gate)
 section has the details and what it costs.
 
 Both checks above were suggested by Dipankar Sarkar on the Hugging Face page of these heads, who also
 found that the stuck-payout template tripped the "money back" cue without anyone asking for a
 refund; its wording is fixed.
+
+## Check it yourself
+
+`check.py` reproduces every generalization number above, and the ones in the main README's
+novelty gate section, from an empty data directory:
+
+```
+python check.py --data-dir check-data
+```
+
+It draws 3,000 tickets at seed 1, imports and trains the three sites through `stuntd import` and
+`stuntd train` with `training.epochs = 24` and `training.cache_max_mb = 2048`, then does the same
+with the first template of each category left out. It asks the heads about 1,000 tickets at seed
+10001 that none of them was trained on, and recomputes each head's novelty cut-off at the 0.95,
+0.98 and 0.99 quantiles from the holdout the way `stuntd train` builds it. It needs a GPU or a lot
+of patience: the run below took about 23 minutes on the laptop RTX 5060 with
+`convaiinnovations/laya`. The progress lines of the imports and of training are left out here;
+the rest is what it printed:
+
+```
+heads trained on all 20 templates
+  gate             answered locally  all three right when local
+  no gate                     72.3%                       97.2%
+  0.95 quantile               67.1%                       97.6%
+  0.98 quantile               69.8%                       97.3%
+  0.99 quantile               70.6%                       97.2%
+changing only channel and plan changes the answer of category on 2.1%, urgency on 10.2%, needs_human on 3.5%
+junk and out-of-scope states, stopped if no head answers them
+  state                        no gate  0.95 quantile  0.98 quantile  0.99 quantile
+  what's the weather in Paris  no       yes            yes            yes
+  asdf qwer zxcv               no       yes            yes            yes
+  {}                           no       yes            yes            yes
+heads trained on 15 templates
+  gate             answered locally  all three right when local
+  no gate                     88.8%                       97.2%
+  0.95 quantile               78.2%                       97.6%
+  0.98 quantile               83.2%                       97.4%
+  0.99 quantile               85.8%                       97.3%
+tickets from the left-out templates
+  gate             answered locally  all three right when local
+  no gate                     68.7%                       42.4%
+  0.95 quantile                0.0%                           -
+  0.98 quantile                0.0%                           -
+  0.99 quantile                0.3%                      100.0%
+```
+
+"Answered locally" means all three heads are sure and, under a gate, none of them finds the ticket
+farther from its training rows than its cut-off; "stopped" means no head would answer the state.
+The heads on all 20 templates came out within 0.2 points of the measurement made before this
+script existed: 72.3% answered locally and 97.4% right without the gate then, 72.3% and 97.2% here.
+`check.py` re-implements the gate rather than calling the daemon; on the same 1,000 tickets a
+running daemon answered 708 locally (70.8%) against the 706 above. On other hardware expect small
+differences.

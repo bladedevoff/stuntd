@@ -28,7 +28,7 @@ Three ways to run it:
 - **In front of the paid Jev API.** stuntd relays, learns from the provider's own answers, and
   takes the decision over once its head is right often enough.
 
-Status: early release, v0.1.3. Every number below traces to a demo in this repository or to a source
+Status: early release, v0.1.4. Every number below traces to a demo in this repository or to a source
 listed at the end.
 
 ## Who it is for
@@ -308,13 +308,14 @@ Each site walks through four modes.
 
 With `serving.auto_promote` and `training.auto_retrain` both set, the loop closes: collect, train,
 shadow, promote, demote, and retrain once `auto_retrain` new distinct texts have arrived since the
-head was trained. A text recorded again does not count twice, and no run for a site starts sooner
-than `training.auto_retrain_min_minutes` (30 by default) after the previous one for that site. The
-daemon runs `stuntd train` for the site as a child process, one at a time, and the new head starts
-in shadow like any other, even when the site was live before: the daemon logs that at warning
-level and `stuntd status` shows `shadow (retrained, was live)`. A failed run is logged with its
-exit code and is not retried until another `auto_retrain` distinct texts arrive; serving carries
-on meanwhile. `stuntd status` shows how the last automatic run ended.
+head was trained, on the OpenAI path and the Jev path alike. A text recorded again does not count
+twice, and no run for a site starts sooner than `training.auto_retrain_min_minutes` (30 by default)
+after the previous one for that site. The daemon runs `stuntd train` for the site as a child
+process, one at a time, and the new head starts in shadow like any other, even when the site was
+live before: the daemon logs that at warning level and `stuntd status` shows `shadow (retrained, was
+live)`. A failed run is logged with its exit code and is not retried until another `auto_retrain`
+distinct texts arrive; serving carries on meanwhile. `stuntd status` shows how the last automatic
+run ended.
 
 In proxy mode the provider behind `[jev] upstream` does not have to be the paid API. Any server
 that speaks `POST /v1/systemone` can sit there -- kev, LLM2Jev, the laya-server family -- which
@@ -377,8 +378,7 @@ label it gave, can be lower.
 ### The novelty gate
 
 A head is sure about what it has seen. Its confidence threshold comes from a holdout of the same
-traffic, so it says nothing about a kind of request the head never saw: the support heads answered
-"what's the weather in Paris" at confidence 1.00.
+traffic, so it says nothing about a kind of request the head never saw.
 
 The gate checks the request before the confidence. Training stores the pooled, normalised encoder
 vector of every training row next to the head (`embeddings.safetensors`, 4.9 MB for the 2,400
@@ -391,28 +391,32 @@ mode it follows [the local fallback](#the-local-fallback). `stuntd report` print
 the share of the holdout it lets through. Heads trained before 0.1.3 have no stored vectors and
 serve as they did.
 
-It ships on: `serving.novelty_gate = true` and `training.novelty_quantile = 0.95`. Measured on the
-support demo ([`examples/support/`](examples/support/)):
+It ships on: `serving.novelty_gate = true` and `training.novelty_quantile = 0.99`. Measured on the
+support demo ([`examples/support/`](examples/support/)), with each head's cut-off recomputed from
+its own holdout at the quantile in the column header:
 
-- **Unseen kinds of ticket.** One template per category held out, the heads trained on 3,000 rows
-  from the other 15 templates, 1,000 held-out tickets: the gate stopped 100% (1000/1000). Without
-  it all three heads were sure on 40.0% of them, and all three right on 61.0% of those.
-- **Unseen states of known templates.** The same heads, 1,000 unseen states of the 15 trained
-  templates (seed 10001): 76.6% answered locally without the gate, 70.6% with it, so 6.0 points go
-  to the provider. All three right when answered locally: 97.4% without, 97.7% with.
-- **Heads trained on all 20 templates.** Unseen states: 72.3% local without the gate, 66.9% with
-  it (5.4 points). The gate stopped 8.1% of these.
-- **Out-of-scope probes.** "what's the weather in Paris", `asdf qwer zxcv` and an empty state `{}`
-  were stopped on all three heads. Without the gate the heads answered the weather probe at
-  confidence 1.00. The category novelty of the probes was 0.197, 0.05 and 0.057 against a cut-off
-  of 0.007.
+| | no gate | 0.95 | 0.98 | 0.99 |
+| --- | --- | --- | --- | --- |
+| templates left out of training, answered locally (heads on 15 templates) | 68.7% | 0.0% | 0.0% | 0.3% |
+| all three right when answered locally | 42.4% | - | - | 100.0% (3 tickets) |
+| new states of the 15 trained templates, answered locally | 88.8% | 78.2% | 83.2% | 85.8% |
+| all three right when answered locally | 97.2% | 97.6% | 97.4% | 97.3% |
+| new states, heads on all 20 templates, answered locally | 72.3% | 67.1% | 69.8% | 70.6% |
+| all three right when answered locally | 97.2% | 97.6% | 97.3% | 97.2% |
 
-The cost is larger than the 5% a single head's cut-off suggests because each field gates on its
-own, and a request with several fields goes to the provider if any field flags it. The release
-aimed for a drop of at most 5 points in local share on familiar requests; the 15-template
-measurement missed that by about one point, and the gate ships on anyway. To get more local
-answers, raise `training.novelty_quantile` (it is read when a head is trained, so retrain) or set
-`serving.novelty_gate = false`. The second lets unseen kinds of input through to the heads again.
+The out-of-scope probes "what's the weather in Paris", `asdf qwer zxcv` and an empty state `{}` are
+stopped at every quantile; without the gate no probe is stopped. At 0.99 the gate gives up 1.7
+to 3.0 points of local share on familiar requests and lets 0.3% of the unseen kinds of ticket
+through, where 0.95 stopped all of them at a cost of 5 to 11 points.
+[`examples/support/check.py`](examples/support/check.py) reproduces every number in this section.
+
+Each field gates on its own, and a request with several fields goes to the provider if any field
+flags it, so the cost on familiar requests is larger than the share a single head's cut-off
+leaves out. `training.novelty_quantile` is read when a head is trained, so retrain after changing
+it; a head trained with 0.1.3 keeps the cut-off stored in its `meta.json`. Raising the quantile
+answers more requests locally and stops fewer unseen kinds of input; lowering it does the
+opposite. `serving.novelty_gate = false` turns the gate off, which lets unseen kinds of input
+through to the heads again.
 
 ### Importing your own rows
 
@@ -544,7 +548,7 @@ from. Every key is optional and a missing one keeps the default.
 | `training.max_option_tokens` | `1024` | How far a site with many or long labels may widen the option budget, in tokens, so every label is shown whole; past it, labels are cut short. A value below the checkpoint's own budget (192) keeps the checkpoint's. |
 | `training.auto_retrain` | `0` | New distinct texts a site needs after its head was trained before the daemon trains it again in the background; 0 leaves training to `stuntd train`. A site without a head first needs `min_examples`. |
 | `training.auto_retrain_min_minutes` | `30` | Minutes a site waits after one automatic run before the daemon may start the next; 0 is no wait. |
-| `training.novelty_quantile` | `0.95` | Quantile of the holdout's novelty used as a head's cut-off, read when the head is trained. Higher lets more requests through. |
+| `training.novelty_quantile` | `0.99` | Quantile of the holdout's novelty used as a head's cut-off, read when the head is trained. Higher lets more requests through. |
 | `serving.check_share` | `0.02` | Share of live requests still sent to the provider to check the head. Inert in local Jev mode. |
 | `serving.window` | `100` | Recent decisions a site is judged on. |
 | `serving.min_window` | `20` | Decisions needed before that judgement counts. |
@@ -617,10 +621,10 @@ coverage 0.57. If your decision is really a calculation, write the calculation, 
 - **A head is sure about what it has seen, not about what is new.** The threshold comes from a
   holdout of the same traffic, so it holds for requests like the ones the head trained on and says
   nothing about a kind of request it never saw. In the support demo, with one ticket template per
-  category left out of training, all three heads were sure on 40% of the new tickets and all three
-  right on 61% of those, against 97% on new tickets from known templates. The
-  [novelty gate](#the-novelty-gate) stopped all of those tickets in the same test, and it costs
-  about 6 points of local share on requests like the training ones. It judges distance from the
+  category left out of training, all three heads were sure on 69% of the new tickets and all three
+  right on 42% of those, against 97% on new tickets from known templates. The
+  [novelty gate](#the-novelty-gate) stopped 99.7% of those tickets in the same test, and it costs
+  2 to 3 points of local share on requests like the training ones. It judges distance from the
   training rows, not correctness: a request that looks familiar and is answered wrongly gets
   through. On live traffic the `check_share` sample is what catches that: a site whose agreement
   with the teacher falls goes back to shadow.
@@ -654,6 +658,9 @@ coverage 0.57. If your decision is really a calculation, write the calculation, 
 - **One CUDA workload at a time.** Stop the daemon before `stuntd train`, or the two contend for
   the same GPU. The same holds for `training.auto_retrain`: the training run it starts shares the
   GPU with serving unless `training.device` is `cpu`.
+  Once, on Windows with three live heads on an 8 GB GPU, a run started this way exited with
+  0xC0000005 and no traceback; `stuntd status` showed `failed (exit 3221225477)`. The same training
+  by hand and a second automatic run both finished, so it is not reproduced.
 - **Every `serve` loads the base checkpoint** at startup, because local Jev answers from it and a
   live head needs it. The daemon runs one pass through the model before it accepts requests, so
   startup costs seconds and the first request then runs close to the steady-state p50. With

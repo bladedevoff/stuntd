@@ -124,6 +124,26 @@ def test_rm_refuses_a_served_site_without_force(data_dir, capsys):
     assert not (data_dir / "models" / "spam").exists()
 
 
+def test_rm_removes_a_site_whose_mode_file_is_unreadable(data_dir, capsys):
+    seed(data_dir, "spam")
+    publish(data_dir, "spam")
+    (data_dir / "models" / "spam" / "mode.json").write_text("{", encoding="utf-8")
+    assert main(["site", "rm", "spam", "--yes"]) == 0
+    assert capsys.readouterr().out == "removed spam\n"
+    assert captured_sites(data_dir) == []
+    assert not (data_dir / "models" / "spam").exists()
+
+
+def test_rm_still_refuses_a_live_field_site_beside_an_unreadable_one(data_dir, capsys):
+    for site, mode in (("triage.category", MODE_LIVE), ("triage.urgent", MODE_SHADOW)):
+        seed(data_dir, site)
+        publish(data_dir, site, mode)
+    (data_dir / "models" / "triage.urgent" / "mode.json").write_text("{", encoding="utf-8")
+    assert main(["site", "rm", "triage", "--yes"]) == 1
+    assert "stuntd: triage.category is served live" in capsys.readouterr().err
+    assert captured_sites(data_dir) == ["triage.category", "triage.urgent"]
+
+
 def test_rm_of_an_unknown_site_is_reported(data_dir, capsys):
     seed(data_dir, "spam")
     assert main(["site", "rm", "ghost", "--yes"]) == 2

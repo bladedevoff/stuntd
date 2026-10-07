@@ -102,6 +102,8 @@ def render_gold(model: SiteModel, score: GoldScore) -> str:
     at = "no threshold" if model.threshold is None else f"threshold {model.threshold:.2f}"
     if score.fallback is not None:
         answered, unserved = "by the head", f"the rest by the {score.fallback} fallback"
+        if score.unserved:
+            unserved += f", {score.unserved} unanswered"
     elif model.threshold is None:
         answered, unserved = "locally", f"{score.unserved} with no teacher answer"
     else:

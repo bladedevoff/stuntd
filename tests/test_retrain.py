@@ -342,3 +342,79 @@ async def test_retrainer_trains_a_new_site_at_once_when_the_wait_is_for_another(
     capture("other")
     capture("other")
     await until(lambda: len(training.commands) == 2)
+
+
+JEV_TONE = {"type": "choice", "instructions": "Tone?", "criteria": {"calm": None, "angry": None}}
+JEV_ANSWER = json.dumps(
+    {
+        "model": "jev-1",
+        "answers": {
+            "tone": {
+                "type": "choice",
+                "choice": "calm",
+                "confidence": 0.9,
+                "probabilities": {"calm": 0.9, "angry": 0.1},
+            }
+        },
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+).encode()
+
+
+@pytest.fixture
+async def jev_client(data_dir):
+    async def provider(request: Request):
+        return Response(content=JEV_ANSWER, media_type="application/json")
+
+    upstream = Starlette(routes=[Route("/{path:path}", provider, methods=["POST"])])
+    app = build_app(
+        Settings(
+            upstream="http://upstream",
+            jev_upstream="http://jev-provider",
+            auto_retrain=2,
+            min_examples=2,
+        ),
+        transport=httpx.ASGITransport(app=upstream),
+        config=data_dir / "stuntd.toml",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as client:
+
+        async def ask(state):
+            body = {"state": state, "model": "jev-latest", "questions": {"tone": JEV_TONE}}
+            response = await client.post("/v1/systemone", json=body)
+            assert response.content == JEV_ANSWER
+
+        yield app, ask
+    await app.state.proxy.aclose()
+
+
+async def test_a_jev_capture_is_counted_toward_auto_retrain(jev_client, monkeypatch):
+    app, ask = jev_client
+    counted = []
+    monkeypatch.setattr(app.state.proxy.retrainer, "record", lambda *args: counted.append(args))
+    await ask("I was charged twice.")
+    assert counted == [("tone", "I was charged twice.")]
+
+
+async def test_a_repeated_jev_text_is_not_counted_twice(jev_client, training):
+    _, ask = jev_client
+    for _ in range(4):
+        await ask("I was charged twice.")
+    await anyio.sleep(0.05)
+    assert training.commands == []
+    await ask("Where is my invoice?")
+    await until(lambda: training.commands)
+
+
+async def test_a_jev_site_retrains_in_the_background(jev_client, training):
+    _, ask = jev_client
+    for index in range(4):
+        await ask(f"Question {index}")
+    await until(lambda: training.commands)
+    assert len(training.commands) == 1
+    assert training.commands[0][4] == "tone"
+    training.release.set()
+    await until(lambda: last_result("tone"))
+    assert last_result("tone") == "ok"

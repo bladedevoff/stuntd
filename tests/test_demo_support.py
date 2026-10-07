@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 from demo_helpers import (
     TypeSafeClient,
@@ -11,6 +13,7 @@ from demo_helpers import (
 from stuntd.jev.state import serialize_state
 
 support, client = load_demo("support")
+_, check = load_demo("support", "check")
 
 ANSWERS = {
     "category": choice_answer("bug", support.CATEGORIES),
@@ -121,3 +124,115 @@ def test_the_client_sends_the_imported_text_and_the_three_questions():
     assert list(asked["category"]["criteria"]) == list(support.CATEGORIES)
     assert asked["urgency"]["type"] == "score"
     assert asked["needs_human"]["type"] == "noul"
+
+
+def _readings(answers, confident=True, novelty=0.1):
+    return {
+        site: [check.Reading(answer[site], confident, novelty) for answer in answers]
+        for site in support.SITES
+    }
+
+
+def _answers(ticket):
+    return {site: teacher(ticket) for site, teacher in support.SITES.items()}
+
+
+def test_tickets_drawn_from_some_templates_use_only_those():
+    chosen = support.TEMPLATES[:3]
+    assert {ticket.template for ticket in support.tickets(1, 200, chosen)} == set(chosen)
+
+
+def test_the_left_out_templates_are_the_first_of_each_category():
+    left_out = check.held_out()
+    assert [template.category for template in left_out] == list(support.CATEGORIES)
+    for template in left_out:
+        first = next(one for one in support.TEMPLATES if one.category == template.category)
+        assert template is first
+
+
+def test_unseen_tickets_skip_the_trained_states():
+    trained = {support.state_text(ticket) for ticket in support.tickets(1, 60)}
+    drawn = check.unseen(trained, support.TEMPLATES, 20)
+    assert len(drawn) == 20
+    assert {support.state_text(ticket) for ticket in drawn}.isdisjoint(trained)
+    assert drawn == check.unseen(trained, support.TEMPLATES, 20)
+
+
+def test_unseen_tickets_come_from_the_templates_asked_for():
+    drawn = check.unseen(set(), check.held_out(), 50)
+    assert {ticket.template for ticket in drawn} <= set(check.held_out())
+
+
+def test_gates_cut_each_site_at_the_quantiles_of_its_holdout_novelty():
+    novelties = {site: [index / 100 for index in range(101)] for site in support.SITES}
+    gates = check.gates(novelties)
+    assert list(gates) == ["no gate", "0.95 quantile", "0.98 quantile", "0.99 quantile"]
+    assert gates["no gate"] == dict.fromkeys(support.SITES)
+    assert gates["0.95 quantile"]["urgency"] == pytest.approx(0.95)
+    assert gates["0.99 quantile"]["category"] == pytest.approx(0.99)
+
+
+def test_a_ticket_is_local_only_when_all_three_heads_are_sure_and_familiar():
+    drawn = support.tickets(1, 4)
+    answers = [_answers(ticket) for ticket in drawn]
+    readings = _readings(answers)
+    readings["urgency"][1] = check.Reading(answers[1]["urgency"], False, 0.1)
+    readings["category"][2] = check.Reading(answers[2]["category"], True, 0.5)
+    readings["needs_human"][3] = check.Reading("wrong", True, 0.1)
+    ungated = check.tally(drawn, readings, dict.fromkeys(support.SITES))
+    assert (ungated.total, ungated.local, ungated.right) == (4, 3, 2)
+    gated = check.tally(drawn, readings, dict.fromkeys(support.SITES, 0.2))
+    assert (gated.total, gated.local, gated.right) == (4, 2, 1)
+
+
+def test_the_probes_are_stopped_when_no_head_answers_them():
+    answers = [{"category": "bug", "urgency": "1", "needs_human": "false"}] * 2
+    readings = _readings(answers, confident=False)
+    readings["urgency"][1] = check.Reading("1", True, 0.9)
+    ungated = dict.fromkeys(support.SITES)
+    assert check.stopped(readings, 0, ungated)
+    assert not check.stopped(readings, 1, ungated)
+    assert check.stopped(readings, 1, dict.fromkeys(support.SITES, 0.5))
+
+
+def test_swapping_the_context_changes_the_channel_and_the_plan_only():
+    ticket = support.tickets(1, 1)[0]
+    twin = check.swapped(ticket)
+    assert twin.channel != ticket.channel
+    assert twin.plan != ticket.plan
+    assert replace(twin, channel=ticket.channel, plan=ticket.plan) == ticket
+
+
+def test_changes_count_the_answers_that_differ_per_site():
+    before = {site: [check.Reading("a", True, 0.1)] * 4 for site in support.SITES}
+    after = {site: list(readings) for site, readings in before.items()}
+    after["urgency"][0] = check.Reading("b", True, 0.1)
+    after["urgency"][1] = check.Reading("b", False, 0.9)
+    assert check.changes(before, after) == {"category": 0, "urgency": 2, "needs_human": 0}
+
+
+def test_the_tallies_are_printed_as_shares():
+    tallies = {"no gate": check.Tally(1000, 723, 703), "0.99 quantile": check.Tally(1000, 0, 0)}
+    assert check.render_tallies("a title", tallies).splitlines() == [
+        "a title",
+        "  gate             answered locally  all three right when local",
+        "  no gate                     72.3%                       97.2%",
+        "  0.99 quantile                0.0%                           -",
+    ]
+
+
+def test_the_probes_are_printed_per_gate():
+    stopped = {"asdf qwer zxcv": {"no gate": False, "0.99 quantile": True}}
+    assert check.render_probes(stopped).splitlines() == [
+        "junk and out-of-scope states, stopped if no head answers them",
+        "  state           no gate  0.99 quantile",
+        "  asdf qwer zxcv  no       yes",
+    ]
+
+
+def test_the_changes_are_printed_per_site():
+    text = check.render_changes({"category": 21, "urgency": 102, "needs_human": 35}, 1000)
+    assert text == (
+        "changing only channel and plan changes the answer of category on 2.1%,"
+        " urgency on 10.2%, needs_human on 3.5%"
+    )

@@ -250,6 +250,25 @@ def test_report_gold_in_local_mode_scores_the_zero_shot_fallback(
     assert decider.questions == [{"s1": JEV_QUESTION}] * 3
 
 
+def test_report_gold_in_local_mode_counts_a_failed_zero_shot_as_unanswered(
+    data_dir, trained, decider, gold, capsys, monkeypatch
+):
+    def fail_on_b(state, questions):
+        if state == "user: b":
+            raise RuntimeError("decision failed: out of memory")
+        return FakeDecider.answer(decider, state, questions)
+
+    monkeypatch.setattr(decider, "answer", fail_on_b)
+    record(data_dir, ("user: a", "refund"), schema=JEV_CANONICAL)
+    assert main(["report", "s1", "--gold", gold]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.splitlines()[3] == (
+        "served accuracy 1.000 at threshold 0.80: 67% answered by the head,"
+        " the rest by the zeroshot fallback, 1 unanswered"
+    )
+    assert "stuntd: zero-shot failed: decision failed: out of memory" in captured.err
+
+
 def test_report_gold_in_local_mode_scores_the_head_fallback(
     data_dir, trained, decider, gold, capsys
 ):
