@@ -74,7 +74,7 @@ module = "tests.*"
 disallow_untyped_defs = false
 
 [[tool.mypy.overrides]]
-module = ["laya", "laya.*", "torch", "torch.*", "safetensors", "safetensors.*"]
+module = ["laya", "laya.*", "torch", "torch.*", "safetensors", "safetensors.*", "transformers", "transformers.*", "huggingface_hub", "huggingface_hub.*"]
 ignore_missing_imports = true
 
 # strict mode surfaces ~90 reportUnknown* findings outside the modules this task covers,
