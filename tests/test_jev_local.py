@@ -101,11 +101,19 @@ def site_model(site, kind="choice", field="tone", labels=("calm", "angry"), thre
 async def serving(data_dir):
     apps = []
 
-    def make(decider=None, *, model=None, mode=None, upstream="http://upstream", **overrides):
+    def make(
+        decider=None,
+        *,
+        zero_shot=None,
+        model=None,
+        mode=None,
+        upstream="http://upstream",
+        **overrides,
+    ):
         settings = Settings(upstream=upstream, **overrides)
         if model is not None:
             write_mode(save_model(models_path(settings), model), mode, now=0.0)
-        app = build_app(settings, decider=decider)
+        app = build_app(settings, decider=decider, zero_shot=zero_shot or decider)
         apps.append(app)
         return app
 
@@ -293,6 +301,31 @@ async def test_a_sampled_check_is_still_answered_by_the_head(serving):
     assert response.headers["x-stuntd"] == "jev; mode=local; questions=1; live=1; zeroshot=0"
     rows = app.state.store.decisions("tone", 10)
     assert [(row.mode, row.answer, row.agree) for row in rows] == [("live", "calm", None)]
+
+
+@pytest.mark.parametrize("mode", [MODE_LIVE, MODE_SHADOW], ids=["live", "shadow"])
+async def test_a_head_trained_on_another_encoder_answers_zero_shot(serving, mode):
+    decider = FakeDecider()
+    app = serving(decider, model=replace(site_model("tone"), encoder="other"), mode=mode)
+    response = await post(app, {"tone": TONE})
+    assert json.loads(response.content)["answers"]["tone"] == CHOICE_ANSWER
+    assert list(decider.batches[0]) == ["tone"]
+    assert response.headers["x-stuntd"] == (
+        "jev; mode=local; questions=1; live=0; zeroshot=1; reason=encoder-mismatch"
+    )
+    assert app.state.store.decisions("tone", 10) == []
+
+
+async def test_the_head_decider_and_the_zero_shot_one_may_be_different_objects(serving):
+    class HeadOnly:
+        def decide(self, model, head_path, text):
+            return SURE_ANGRY
+
+    zero_shot = FakeDecider()
+    app = serving(HeadOnly(), zero_shot=zero_shot, model=site_model("tone"), mode=MODE_LIVE)
+    response = await post(app, {"tone": TONE, "billing": BILLING})
+    assert json.loads(response.content)["answers"]["tone"]["choice"] == "angry"
+    assert list(zero_shot.batches[0]) == ["billing"]
 
 
 async def test_a_decider_that_fails_is_reported(serving, caplog):

@@ -23,6 +23,7 @@ from starlette.websockets import WebSocketClose
 
 from stuntd.decisions.schema import DecisionSchema, Schema
 from stuntd.decisions.site import field_site, site_key
+from stuntd.oai import decisions
 from stuntd.proxy.capture import decoded_json
 from stuntd.proxy.dialects import DIALECTS, Dialect
 from stuntd.proxy.headers import (
@@ -33,6 +34,7 @@ from stuntd.proxy.headers import (
     stuntd_header,
 )
 from stuntd.proxy.jev import JevRoutes
+from stuntd.proxy.questions import QuestionRoutes, Wire
 from stuntd.serve.modes import (
     MODE_CHECK,
     MODE_COLLECT,
@@ -42,7 +44,7 @@ from stuntd.serve.modes import (
     site_states,
 )
 from stuntd.serve.retrain import Retrainer
-from stuntd.serve.runtime import DeciderLike, Outcome, Runtime, input_hash
+from stuntd.serve.runtime import HeadDecider, Outcome, Runtime, ZeroShot, input_hash
 from stuntd.settings import Settings, database_path, models_path
 from stuntd.store.db import Capture, Store
 from stuntd.store.redact import Redactor
@@ -72,11 +74,13 @@ class Proxy:
         self,
         settings: Settings,
         transport: httpx.AsyncBaseTransport | None = None,
-        decider: DeciderLike | None = None,
+        decider: HeadDecider | None = None,
         config: Path | None = None,
+        zero_shot: ZeroShot | None = None,
     ) -> None:
         self.settings = settings
         self.decider = decider
+        self.zero_shot = zero_shot
         self.store: Store | None = None
         self.runtime: Runtime | None = None
         self.retrainer: Retrainer | None = None
@@ -206,7 +210,9 @@ class Proxy:
             reason = runtime.state_reason(site)
         elif any(state.model is not None for state in states):
             index = next(i for i, state in enumerate(states) if state.mode != MODE_LIVE)
-            reason = _field_reason(_NOT_LIVE, schema, site, index)
+            reason = _field_reason(
+                runtime.state_reason(states[index].site) or _NOT_LIVE, schema, site, index
+            )
         else:
             reason = None
         return await self._collect(
@@ -460,11 +466,12 @@ def _passthrough(upstream: httpx.Response, reason: str) -> Response:
 def build_app(
     settings: Settings,
     transport: httpx.AsyncBaseTransport | None = None,
-    decider: DeciderLike | None = None,
+    decider: HeadDecider | None = None,
     config: Path | None = None,
+    zero_shot: ZeroShot | None = None,
 ) -> Starlette:
     """Wires a Starlette app around one Proxy: a single mount, the lifespan and app.state."""
-    proxy = Proxy(settings, transport, decider, config)
+    proxy = Proxy(settings, transport, decider, config, zero_shot)
     asgi_app = request_response(proxy.relay)
 
     async def endpoint(scope: Scope, receive: Receive, send: Send) -> None:
@@ -482,6 +489,17 @@ def build_app(
             await proxy.aclose()
 
     jev = JevRoutes(proxy)
+    decide = QuestionRoutes(
+        proxy,
+        Wire(
+            "/v1/decisions",
+            decisions.parse_request,
+            decisions.answers_body,
+            decisions.error_body,
+            decisions.provider_answers,
+        ),
+        settings.upstream,
+    )
     # A Route with a function endpoint answers 405 to anything it was not given; which methods
     # exist is the provider's business. The daemon's own routes come first, or the mount below
     # would relay them to the provider.
@@ -490,6 +508,7 @@ def build_app(
             Route("/healthz", proxy.healthz, methods=["GET"]),
             Route("/v1/systemone", jev.systemone, methods=["POST"]),
             Route("/v1/models", jev.models, methods=["GET"]),
+            Route("/v1/decisions", decide.answer, methods=["POST"]),
             Mount("/", app=endpoint),
         ],
         lifespan=lifespan,

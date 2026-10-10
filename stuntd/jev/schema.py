@@ -13,8 +13,10 @@ __all__ = [
     "MIN_SCORE_LEVELS",
     "Question",
     "SystemOneRequest",
+    "build_question",
     "kind_for",
     "laya_question",
+    "load_body",
     "parse_request",
     "typed_field",
 ]
@@ -33,7 +35,7 @@ _QUESTION_NAME = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 
 
 class JevError(Exception):
-    """A malformed Jev request: the message and status code its error body carries."""
+    """A malformed Jev or Decisions request: the message and status code its error body carries."""
 
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
@@ -145,7 +147,8 @@ def _labels(name: str, question_type: str, criteria: object) -> tuple[str, ...]:
     return _NOUL_LABELS
 
 
-def _question(name: str, raw: object) -> Question:
+def build_question(name: str, raw: object) -> Question:
+    """Validates one question object and names the decision site it lands on."""
     if not isinstance(raw, dict):
         raise JevError(f'Question "{name}" must be an object')
     question_type = raw.get("type")
@@ -169,13 +172,22 @@ def _question(name: str, raw: object) -> Question:
     )
 
 
+def load_body(body: bytes) -> Any:
+    """Reads a request body as JSON; one that is not JSON, nests past the recursion limit or
+    carries a lone UTF-16 surrogate raises JevError."""
+    try:
+        # JSON values are Any by nature; every caller narrows before it uses one.
+        payload: Any = json.loads(body)
+        # A lone surrogate parses but cannot be encoded, so hashing and storage would fail on it.
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    except (ValueError, RecursionError):
+        raise JevError("request body must be valid JSON")
+    return payload
+
+
 def parse_request(body: bytes) -> SystemOneRequest:
     """Parses a POST /v1/systemone body into its state and its typed questions."""
-    try:
-        # JSON values are Any by nature; every branch below narrows before it is used.
-        payload: Any = json.loads(body)
-    except ValueError:
-        raise JevError("request body must be valid JSON")
+    payload = load_body(body)
     if not isinstance(payload, dict):
         raise JevError("request body must be a JSON object")
     if "state" not in payload:
@@ -194,5 +206,5 @@ def parse_request(body: bytes) -> SystemOneRequest:
     return SystemOneRequest(
         state=state,
         model=model,
-        questions=tuple(_question(name, raw) for name, raw in questions.items()),
+        questions=tuple(build_question(name, raw) for name, raw in questions.items()),
     )

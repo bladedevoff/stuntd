@@ -10,10 +10,10 @@
 
 **stuntd is a local, self-hosted proxy that records the typed decisions your app already makes and
 learns to answer them itself.** It speaks the Jev System One protocol (`POST /v1/systemone`, with
-`choice`, `score` and `noul` questions), the OpenAI Chat Completions API and the Anthropic
-Messages API, distils each decision
-site into a small head on a frozen [Laya](https://huggingface.co/convaiinnovations/laya) encoder,
-and serves that answer locally with calibrated confidence, handing anything it is unsure about back
+`choice`, `score` and `noul` questions), the OpenAI Decisions API (`POST /v1/decisions`), the
+OpenAI Chat Completions API and the Anthropic Messages API, distils each decision
+site into a small head on a frozen [Laya](https://huggingface.co/convaiinnovations/laya) encoder
+or a stock sentence encoder, and serves that answer locally with calibrated confidence, handing anything it is unsure about back
 to the provider.
 
 **Try it in the browser:** the [Hugging Face Space](https://huggingface.co/spaces/pollix/stuntd)
@@ -24,11 +24,12 @@ Three ways to run it:
 - **Local Jev.** No key, no provider, no training. Point `typesafe-sdk` at stuntd and the base Laya
   checkpoint answers your typed questions.
 - **In front of OpenAI or Anthropic.** A drop-in replacement for the provider base URL. Typed
-  requests are recorded; everything else is relayed byte for byte.
+  requests, Decisions API questions included, are recorded; everything else is relayed byte for
+  byte.
 - **In front of the paid Jev API.** stuntd relays, learns from the provider's own answers, and
   takes the decision over once its head is right often enough.
 
-Status: early release, v0.1.4. Every number below traces to a demo in this repository or to a source
+Status: early release, v0.2.0. Every number below traces to a demo in this repository or to a source
 listed at the end.
 
 ## Who it is for
@@ -171,6 +172,65 @@ on every `triage.<field>` that has a head and prints each one. While some fields
 live ones are still compared against the provider's answer on every request, so their agreement
 keeps moving and a field that drifts is demoted on its own.
 
+## Quickstart: OpenAI Decisions API
+
+OpenAI's Decisions API (`POST /v1/decisions`, model `gpt-6-luna`, public beta since 2026-10-06)
+asks typed questions of a text: `predicate`, `choice` and `score`. stuntd learns them the way it
+learns Jev questions: a predicate is a `noul`, a choice and a score keep their options, and every
+question is a decision site named after its `name`.
+
+Local, with no key. `stuntd serve` answers from a trained head where there is one and from
+zero-shot Laya for the rest:
+
+```
+stuntd serve
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="local")
+
+decision = client.decisions.create(
+    model="gpt-6-luna",
+    input="Charged twice for the same invoice",
+    questions=[
+        {
+            "type": "predicate",
+            "name": "needs_human",
+            "instructions": "Does a person have to read this?",
+        },
+        {
+            "type": "choice",
+            "name": "category",
+            "instructions": "Which part of the product is this about?",
+            "choices": [{"value": "billing"}, {"value": "bug"}],
+        },
+    ],
+)
+print([answer.type for answer in decision.answers])
+```
+
+In front of OpenAI, the same client with the real key and the daemon started with
+`stuntd serve --upstream https://api.openai.com`. A request is answered locally only when every one
+of its questions has a live head that is sure; otherwise it goes to OpenAI untouched and each
+answer is recorded as the label of its question. Then `stuntd train`, `report` and `enable` work
+exactly as for the other paths, and `X-Stuntd` carries the Jev-style header described
+[below](#the-x-stuntd-header).
+
+What stuntd does not learn is relayed whole in proxy mode and never breaks the caller: an
+`input_image` part, a choice whose string and boolean values collide (`"true"` and `true`), a score
+with more than 10 levels, duplicate names, an unknown question type, a choice with fewer than two
+values, a message whose role is not `user`, a body that is not JSON, nests too deeply or carries a
+lone UTF-16 surrogate. A refusal answer from the
+provider is relayed and is not recorded as a label. In local mode the same requests get an
+OpenAI-shaped 400 (`{"error": {"message": ..., "type": "invalid_request_error", ...}}`).
+
+**Not measured against the live API.** The request and response shapes were checked against the
+[Decisions guide](https://developers.openai.com/api/docs/guides/decisions) and the `openai` 3.27.0
+SDK types, and the tests pin them with fixtures built from those shapes. Nothing here was run
+against the real service.
+
 ## Quickstart: in front of Anthropic
 
 ```
@@ -257,6 +317,35 @@ Zero-shot Laya holds its own at two or four labels and collapses at seventy-seve
 on a few thousand of your own examples does not: that is the bet stuntd makes, and the four demos
 are what it is measured against.
 
+### Laya against stock encoders
+
+[`benchmarks/encoders.py`](benchmarks/) trains one site per encoder on a stratified sample of 3,000
+training rows of MASSIVE intent (60 intents; ru, de, es, zh, ja, en) and Banking77 (77 intents), and
+scores every row of the official test split. Accuracy of every answer, Laya at 24 epochs, the
+others as `training.encoder`. The stock-encoder figures were identical in two full runs; Laya's
+differ between runs, so its cell gives the lower and the higher:
+
+| dataset | Laya (two runs) | multilingual-e5-base | multilingual-e5-small | all-MiniLM-L6-v2 |
+| --- | --- | --- | --- | --- |
+| MASSIVE ru | 26.2% to 27.2% | 81.6% | 78.6% | 54.7% |
+| MASSIVE de | 29.5% to 31.5% | 79.6% | 75.9% | 65.1% |
+| MASSIVE es | 34.3% to 34.4% | 80.5% | 78.0% | 63.5% |
+| MASSIVE zh | 42.7% to 44.1% | 79.8% | 78.3% | 40.2% |
+| MASSIVE ja | 32.1% to 32.2% | 79.8% | 79.5% | 57.7% |
+| MASSIVE en | 60.1% to 60.7% | 83.7% | 81.2% | 81.0% |
+| Banking77 | 65.1% to 66.1% | 89.6% | 87.5% | 90.0% |
+
+At each head's own threshold for 99% agreement, multilingual-e5-base answers 18.0% to 41.9% of the
+MASSIVE test rows locally, at 97.9% to 99.3% accuracy, and 60.8% of Banking77's; across the two
+runs Laya answers 0.0% to 5.9% of the MASSIVE rows and 4.9% to 6.5% of Banking77's. Training a
+stock head took 3.2 to 8.7 s on MASSIVE, Laya 236.4 to 308.7 s, and 1,768.8 to 1,860.3 s on
+Banking77, where the encoder cache did not fit the 2,048 MB budget. One batch-1 decision on the CPU
+has a p50 of 14.0 to 26.6 ms with multilingual-e5-base on MASSIVE and 337.4 to 401.7 ms with Laya.
+The latency and training-time columns did not reproduce within 25% on every row between the two
+runs, so read them as an order of magnitude. The laptop, the versions, the dataset revisions and
+both full tables with coverage, local share and p95 are in
+[`benchmarks/README.md`](benchmarks/README.md).
+
 ## How stuntd distils decisions into a Laya head
 
 ```
@@ -319,7 +408,8 @@ run ended.
 
 In proxy mode the provider behind `[jev] upstream` does not have to be the paid API. Any server
 that speaks `POST /v1/systemone` can sit there -- kev, LLM2Jev, the laya-server family -- which
-makes it a keyless local teacher: it answers, stuntd records, and the head learns from it.
+makes it a keyless local teacher: it answers, stuntd records, and the head learns from it. See
+[Teachers](#teachers) for the four documented ones.
 
 Nothing is uploaded. Captures live in a SQLite file under your user directory with private
 permissions, and there is no telemetry.
@@ -462,6 +552,9 @@ Default site keys have not changed, so stores and heads from earlier versions ke
 without loading a checkpoint, which makes it usable as a container health check. `stuntd serve`
 writes a pid file under the data directory and `stuntd stop` ends that daemon; it exits 1 and says
 so when none is running. `stuntd train` prints one line per epoch to stderr while it works.
+`/healthz` counts a site by its recorded mode, so a site whose head was trained on another encoder
+still counts as live there; `stuntd status` is where `encoder-mismatch` shows. `stuntd train` names
+the encoder as "downloaded on first use" before it checks that a path exists.
 
 ### How many rows and how many epochs
 
@@ -481,6 +574,52 @@ with one encoder and rule-written teachers. Take them as a starting point.
   interval clears your target to one whose point estimate does. `stuntd report SITE --gold FILE`
   says whether the teacher itself was right.
 
+### Stock sentence encoders
+
+Laya is the default. `training.encoder` can instead name a stock sentence encoder, a Hugging Face
+id or a local folder, and `stuntd train` then fits a linear head on its frozen, pooled vectors.
+Three have a known input prefix; any other id uses the `query` prompt of its
+`config_sentence_transformers.json`, or no prefix.
+
+| `training.encoder` | size | licence | languages | prefix |
+| --- | --- | --- | --- | --- |
+| `laya` (default) | ModernBERT | Apache-2.0 | mostly English | none |
+| `intfloat/multilingual-e5-base` | 278M | MIT | multilingual | `query: ` |
+| `intfloat/multilingual-e5-small` | 118M | MIT | multilingual | `query: ` |
+| `sentence-transformers/all-MiniLM-L6-v2` | 23M | Apache-2.0 | English | none |
+
+Which to pick. The [benchmark](#laya-against-stock-encoders) has the numbers.
+
+- **Laya** if you want the head and the zero-shot fallback to share one model. It is the only
+  encoder that answers zero-shot, and the slowest to train and to run on a CPU.
+- **multilingual-e5-base** for anything that is not English, or for many labels. It was the most
+  accurate on every MASSIVE language and close to the best on Banking77.
+- **multilingual-e5-small** when the CPU budget matters more than the last few points: about half
+  the latency of the base model.
+- **all-MiniLM-L6-v2** for English only, and the smallest and fastest head. On Banking77 and MASSIVE
+  `en` it is close to the larger encoders; on the other languages it is not.
+
+- **What is accepted.** The encoder is loaded with `trust_remote_code=False`. `config.json` is read
+  first, and a `model_type` outside `bert`, `distilbert`, `roberta`, `xlm-roberta`, `mpnet` and
+  `modernbert`, or an `auto_map` entry, stops `stuntd train` and `stuntd serve` with one line
+  before any weights are fetched. Pooling follows `1_Pooling/config.json`, mean or CLS (mean when
+  the file is absent); any other pooling is refused. The input is cut at `max_seq_length` from
+  `sentence_bert_config.json`, else 512 tokens.
+- **Zero-shot stays Laya.** A local Jev or Decisions request answers what no head answers from the
+  Laya checkpoint, whatever `training.encoder` is, and a daemon that never needs zero-shot never
+  loads Laya.
+- **Epochs.** A stock encoder runs once per row and the head trains for a fixed 80 epochs on the
+  stored vectors, so `training.epochs` does not apply. The count, the learning rate and the weight
+  decay were chosen on the validation split of MASSIVE `en`, never its test split.
+- **A head is served only by the encoder it was trained on.** `meta.json` records the encoder, and
+  a head without that field is a Laya head, so 0.1.x heads serve unchanged. If `training.encoder`
+  names a different encoder, the site is treated as if it had no live head: the provider answers
+  in proxy mode, zero-shot Laya in local mode, `X-Stuntd` carries `reason=encoder-mismatch`,
+  `stuntd status` shows `collect (encoder-mismatch)` and the daemon logs one warning per site.
+- **Switching.** Change `training.encoder` in `stuntd.toml`, stop the daemon, run `stuntd train`,
+  check the new head with `stuntd report`, `stuntd enable SITE`, and start the daemon again.
+  Until a site is retrained it keeps the mismatch.
+
 ### The `X-Stuntd` header
 
 Every answer says how it was served, so a silent fallback cannot hide.
@@ -498,7 +637,7 @@ X-Stuntd: passthrough; reason=no-schema
 | mode | `live`, `shadow`, `collect`, `passthrough` |
 | `site=` | the decision site this request landed on |
 | `confidence=` | the head's calibrated confidence, two decimals, on a live answer |
-| `reason=` | `no-schema`, `unsupported-schema`, `streaming`, `learning-off`, `no-upstream`, `low-confidence`, `novel`, `check`, `retrained`, `model-error`, `no-runtime`, `state-error`, `upstream-error`; on a multi-field request `low-confidence:<field>`, `novel:<field>` and `not-live:<field>` name the field that kept it from being local |
+| `reason=` | `no-schema`, `unsupported-schema`, `streaming`, `learning-off`, `no-upstream`, `low-confidence`, `novel`, `check`, `retrained`, `encoder-mismatch`, `model-error`, `no-runtime`, `state-error`, `upstream-error`; on a multi-field request `low-confidence:<field>`, `novel:<field>` and `not-live:<field>` name the field that kept it from being local |
 
 On the Jev path: the mode it served in, then how the questions were answered.
 
@@ -509,6 +648,8 @@ X-Stuntd: jev; mode=local; questions=1; live=0; zeroshot=1; learn=off
 X-Stuntd: jev; mode=local; reason=no-key
 ```
 
+`POST /v1/decisions` answers with the same Jev-style header.
+
 | field | values |
 | --- | --- |
 | `mode=` | `local` (no Jev provider behind it) or `proxy` (the paid API is) |
@@ -518,7 +659,52 @@ X-Stuntd: jev; mode=local; reason=no-key
 | `zeroshot=` | answered by the base checkpoint, local mode only |
 | `check=` | sampled for a comparison with the provider, proxy mode only |
 | `learn=off` | `learn = false`, so nothing was recorded |
-| `reason=` | `no-key`, `bad-request`, `not-parsed`, `no-runtime`, `model-error`, `upstream-error` |
+| `reason=` | `no-key`, `bad-request`, `not-parsed`, `no-runtime`, `model-error`, `upstream-error`, `encoder-mismatch` |
+
+## Teachers
+
+In proxy mode `[jev] upstream` can be any server that speaks the System One request. These four
+are documented as Jev-compatible; for each, `tests/test_teachers.py` sends its documented request
+through stuntd to a fake upstream that answers with its documented response, and checks that the
+answer comes back byte for byte and that the right label is recorded for every question. Nothing
+was run against a real model or API here, and no weights were downloaded: what is verified is the
+wire format as each project's own documentation or server source writes it.
+
+| teacher | licence | how to run or reach it | `jev.upstream` |
+| --- | --- | --- | --- |
+| [Kev](https://github.com/jaredpalmer/kev) 0.8b to 27b | Apache-2.0, code and weights | `python -m kev.serve --run jaredpalmer/kev-4b --port 8009`; a GPU or Apple Silicon; open unless `KEV_API_KEY` is set, then a Bearer token | `http://127.0.0.1:8009` |
+| [Mica v0.1 4B](https://github.com/akivet/Mica-v0.1-4B) | Apache-2.0, code and weights | `bash scripts/serve.sh`, a llama.cpp server on port 8010; no auth | `http://127.0.0.1:8010` |
+| [Perplexity Decider v1.1](https://docs.perplexity.ai/docs/decisions/quickstart) 27B | hosted API; weights Apache-2.0 | hosted at `https://api.perplexity.ai/v1/decisions` with a Bearer key and `model` set to `pplx-decider-v1.1-27b`; self-hosted through SGLang on `/v1/systemone` | `https://api.perplexity.ai` with `jev.path = "/v1/decisions"` |
+| [Strom](https://platform.uprelic.com/skill.md) | hosted only; no weights licence found | `https://api.uprelic.com/v1/systemone` with a Bearer key and `model` set to `strom-1.0.7` | `https://api.uprelic.com` |
+
+The caller's `Authorization` header and `model` field cross unchanged, so the key and the model name
+stay the caller's business. `jev.path` is the path stuntd relays System One requests to; callers
+still send them to stuntd's own `/v1/systemone`.
+
+What differs from Jev, and what stuntd does about it:
+
+- **Kev** answers invalid requests with HTTP 422 and adds a top-level `latency_ms`; both cross
+  untouched, and a 422 records nothing. It allows up to 255 score levels where stuntd learns at
+  most 10: a question with more is relayed and not learned.
+- **Mica** documents its request without a `model`, which stuntd cannot parse: that request is
+  relayed whole and nothing is learned from it, so send `model` as the Jev SDKs do. Its score
+  answer is an integer with no `legend` and every answer carries an extra `answer`; stuntd records
+  the level from `probabilities`. Errors are `{"error": "..."}` with status 400. The README gives no
+  sample response, so the contract test follows the shape in its server source.
+- **Perplexity** takes the System One body at `/v1/decisions`, requires `model`, and reports errors
+  in an OpenAI-style body. Its images go inside `state`, and stuntd records a `state` object as its
+  JSON text, so keep images out of requests you want learned.
+- **Strom** adds `cached_input_tokens`, `cost` and `currency` to `usage` and a `metadata` object;
+  stuntd reads the token counts it knows and ignores the rest. Its images use a `media` field that
+  stuntd does not read. The docs show no score response, so only `choice` and `noul` are tested.
+
+A teacher answer that has no usable label for a question (a score without `probabilities`, a choice
+the question never offered) is relayed and that question is not recorded.
+
+Not verified: Kev's default port when `--port` is omitted; Mica's response from a running server;
+the SGLang launch command and local auth for Perplexity Decider; Strom's weights licence and error
+bodies beyond the status codes its docs list. `GET /v1/models` is relayed to the provider; whether
+Perplexity's hosted API serves it was not verified.
 
 ## Configuration
 
@@ -541,7 +727,8 @@ from. Every key is optional and a missing one keeps the default.
 | `training.holdout` | `0.2` | Share of the rows held back to measure the head. |
 | `training.target_agreement` | `0.99` | Agreement with the teacher the head must reach; it sets the confidence threshold. |
 | `training.base_model` | `convaiinnovations/laya` | Checkpoint the heads are trained on. A local directory works too. |
-| `training.epochs` | `3` | Passes over the training rows. The demos use 24. |
+| `training.encoder` | `laya` | `laya`, or a Hugging Face id or local folder of a sentence encoder. A head serves only while this names the encoder it was trained on. See [Stock sentence encoders](#stock-sentence-encoders). |
+| `training.epochs` | `3` | Passes over the training rows of a Laya head. The demos use 24. A stock encoder ignores it. |
 | `training.device` | `auto` | `auto`, `cpu`, `cuda` or `mps`. |
 | `training.cache_encoder` | `true` | Whether the frozen encoder runs once per example instead of once per epoch; off re-encodes. |
 | `training.cache_max_mb` | `0` | Most memory the cached encoder output may take, in megabytes; 0 is half of physical memory. A bigger site trains uncached and says so on stderr. |
@@ -559,6 +746,7 @@ from. Every key is optional and a missing one keeps the default.
 | `serving.local_fallback` | `"zeroshot"` | What a local Jev answers with when a head is unsure or the request is novel: `"zeroshot"`, the base checkpoint, or `"head"`, the head anyway. |
 | `serving.lazy_load` | `false` | Whether the base checkpoint loads on the first request instead of at startup. A failed load answers that request from the provider and is retried on the next one. `stuntd serve --lazy` sets it. |
 | `jev.upstream` | `""` | Origin of the paid Jev provider, no path. Empty: the base Laya answers locally. |
+| `jev.path` | `/v1/systemone` | Path the Jev provider serves System One on; only the relay to it uses this. See [Teachers](#teachers). |
 | `jev.require_key` | `false` | Whether a Jev request must carry a Bearer token. The token itself is not checked. |
 | `jev.model_name` | `stuntd` | Name reported in the `model` field of a Jev answer. |
 
@@ -631,6 +819,14 @@ coverage 0.57. If your decision is really a calculation, write the calculation, 
 - **OpenAI Chat Completions and Anthropic Messages learn.** The OpenAI Responses API and Gemini
   pass through untouched, and so does any streaming request. Codex CLI and Gemini CLI run through
   stuntd as if it were not there.
+- **Decisions images are relayed, not learned.** A Decisions request with an `input_image` part is
+  passed to the provider in proxy mode and gets a 400 in local mode, because the encoders read text
+  only. The Decisions path is not measured against the live service: see
+  [its quickstart](#quickstart-openai-decisions-api).
+- **Decisions in local mode take user messages and choices of two or more values.** A message with
+  another role (`system`, `developer`, `assistant`) or a choice with fewer than two values gets a
+  400 locally and is relayed in proxy mode. `/v1/systemone` with a one-option choice reaches Laya,
+  which fails, and the caller gets a 503 `model-error`.
 - **A multi-field decision needs every field typed, at most 8.** One property that is free text,
   an array or a nested object makes the whole request free text, and it is relayed and never
   recorded. A property the provider leaves out is not recorded for that request.
@@ -716,6 +912,11 @@ coverage 0.57. If your decision is really a calculation, write the calculation, 
   of public Jev projects, integrations and discussions. A good place to check whether your decision
   is a pattern other people already run.
 
+- [**OpenAI Decisions API**](https://developers.openai.com/api/docs/guides/decisions) is the hosted
+  service with the same three question types. stuntd sits in front of it, learns from its answers
+  and takes the repeated ones over; it does not replace it for requests with images or for
+  decisions it has no head for.
+
 None of them learns from live traffic: recording the provider's own answers, a shadow phase, a
 calibrated threshold and a fallback for everything under it is the loop stuntd adds. And every
 Jev-compatible server above -- the laya-server family, kev, LLM2Jev -- can sit behind stuntd as
@@ -726,13 +927,14 @@ Jev-compatible server above -- the laya-server family, kev, LLM2Jev -- can sit b
 Next: support for new formats.
 
 - Adapters for the OpenAI Responses API and Gemini, so those paths learn too.
+- Measuring the Decisions path against the live API once a key is available.
 
 Later:
 
 - `stuntd eval` against baselines, so a head can be compared with zero-shot and a fine-tuned
   encoder on your own rows.
 - CPU and ONNX serving, and a container image.
-- Multilingual checkpoints, and other encoders.
+- Unfrozen stock encoders, and a zero-shot backend other than Laya.
 - Encode the state once per request instead of once per question, for multi-question latency.
 - Option-order augmentation during training.
 - Dynamic candidate options, so a site whose option list changes does not need a new head.

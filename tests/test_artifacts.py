@@ -76,6 +76,21 @@ def test_metadata_without_a_layout_loads_as_the_checkpoint_one(tmp_path):
     assert loaded == model()
 
 
+def test_round_trip_keeps_the_encoder(tmp_path):
+    stock = replace(model(), encoder="intfloat/multilingual-e5-base")
+    save_model(tmp_path / "models", stock)
+    assert load_model(tmp_path / "models", "s1").encoder == "intfloat/multilingual-e5-base"
+
+
+def test_metadata_without_an_encoder_loads_as_laya(tmp_path):
+    raw = asdict(model())
+    del raw["encoder"]
+    folder = tmp_path / "models" / "s1"
+    folder.mkdir(parents=True)
+    (folder / META_FILE).write_text(json.dumps(raw), encoding="utf-8")
+    assert load_model(tmp_path / "models", "s1").encoder == "laya"
+
+
 def test_metadata_without_statistics_loads_without_them(tmp_path):
     raw = asdict(model())
     for key in ("agreement_interval", "covered_interval", "n_covered"):

@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 from stuntd.train.artifacts import SiteModel
 from stuntd.train.metrics import ClassStats, ConfidentError, Interval, Operating
@@ -44,6 +45,13 @@ def test_render_shows_the_headline_numbers():
     assert "0.97  0.98  expected block, got allow: user: " in text
     assert "x" * 100 in text
     assert "threshold  coverage  agreement" not in text
+
+
+def test_render_names_the_encoder_of_a_head_trained_on_a_stock_encoder():
+    site = replace(model(), encoder="intfloat/multilingual-e5-base")
+    headline = render(site).splitlines()[0]
+    assert headline.endswith("encoder intfloat/multilingual-e5-base")
+    assert "base " not in headline
 
 
 def test_render_shows_the_intervals_and_the_rows_behind_them():

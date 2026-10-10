@@ -32,9 +32,10 @@ from stuntd.serve.modes import (
 )
 from stuntd.serve.monitor import window_agreement, window_start
 from stuntd.serve.retrain import last_result
-from stuntd.serve.runtime import is_novel
+from stuntd.serve.runtime import ENCODER_MISMATCH, is_novel
 from stuntd.settings import (
     CONFIG_TEMPLATE,
+    LAYA_ENCODER,
     Settings,
     config_path,
     database_path,
@@ -51,12 +52,15 @@ from stuntd.train.artifacts import (
     rename_model,
     site_dir,
 )
+from stuntd.train.encoders import EncoderSpec, resolve_encoder
 from stuntd.train.gold import GoldRow, render_gold, render_gold_json, score_gold
 from stuntd.train.report import render, render_json
 from stuntd.train.run import NO_CAPTURES, Trainer, TrainResult, train_sites
 
 if TYPE_CHECKING:
-    from stuntd.serve.runtime import DeciderLike
+    from stuntd.serve.decider import Decider
+    from stuntd.serve.pooled import PooledDecider
+    from stuntd.serve.runtime import HeadDecider, ZeroShot
     from stuntd.store.db import Capture, Store
     from stuntd.store.redact import Redactor
 
@@ -99,11 +103,28 @@ def _require_learning(config: str | None, settings: Settings) -> None:
         raise _LearningOff(f"learning is off in {_config_file(config)}")
 
 
-def _make_decider(settings: Settings) -> DeciderLike:
+def _make_decider(settings: Settings) -> Decider:
     # The only place serving reaches torch and laya, so every other command runs without the extra.
     from stuntd.serve.decider import Decider
 
     return Decider(settings.base_model, settings.device, settings.lazy_load)
+
+
+def _make_pooled_decider(settings: Settings, encoder: EncoderSpec) -> PooledDecider:
+    from stuntd.serve.pooled import PooledDecider
+
+    return PooledDecider(encoder, settings.device, settings.lazy_load)
+
+
+def _gold_deciders(
+    settings: Settings, model: SiteModel, zero_shot: bool
+) -> tuple[HeadDecider, ZeroShot | None]:
+    # Zero-shot answers always come from Laya, whatever encoder the head was trained on.
+    if model.encoder == LAYA_ENCODER:
+        decider = _make_decider(settings)
+        return decider, decider if zero_shot else None
+    pooled = _make_pooled_decider(settings, resolve_encoder(model.encoder))
+    return pooled, _make_decider(settings) if zero_shot else None
 
 
 def _require_serving() -> None:
@@ -114,25 +135,33 @@ def _require_serving() -> None:
         raise ValueError('serving needs the train extra: pip install "stuntd[train]"') from exc
 
 
-def _serve_decider(settings: Settings, serving: int) -> DeciderLike | None:
-    # A local Jev answers its questions zero-shot from the base checkpoint, trained head or not,
-    # so it needs the decider even where no site serves one of its own.
-    local_jev = settings.jev_upstream == ""
-    if serving == 0 and not local_jev:
-        return None
+def _serve_deciders(settings: Settings, serving: int) -> tuple[HeadDecider | None, ZeroShot | None]:
+    # A question endpoint without a provider behind it, Jev or Decisions, answers zero-shot from
+    # the base checkpoint, trained head or not, so it needs the checkpoint even where no site
+    # serves a head of its own.
+    needs_zero_shot = settings.upstream == "" or settings.jev_upstream == ""
     try:
-        return _make_decider(settings)
+        if settings.encoder == LAYA_ENCODER:
+            if serving == 0 and not needs_zero_shot:
+                return None, None
+            decider = _make_decider(settings)
+            return decider, decider
+        # Resolved even when nothing serves yet, so a mistyped encoder stops the daemon here
+        # rather than at the first training run.
+        encoder = resolve_encoder(settings.encoder)
+        heads = _make_pooled_decider(settings, encoder) if serving else None
+        return heads, _make_decider(settings) if needs_zero_shot else None
     except ImportError:
         # The proxy still records captures, so a missing extra costs the answers, not the run.
         print('stuntd: serving disabled: pip install "stuntd[train]"', file=sys.stderr)
-        return None
+        return None, None
 
 
-def _serving_sites(models: Path) -> list[tuple[str, SiteModel]]:
+def _serving_sites(models: Path, encoder: str) -> list[tuple[str, SiteModel]]:
     return [
         (state.site, state.model)
         for state in site_states(models)
-        if state.mode != MODE_COLLECT and state.model is not None
+        if state.mode != MODE_COLLECT and state.model is not None and state.model.encoder == encoder
     ]
 
 
@@ -145,28 +174,31 @@ def _serve(args: argparse.Namespace) -> int:
 
     models = models_path(settings)
     # With learning off no head answers, so the sites on disk serve nothing.
-    serving = _serving_sites(models) if settings.learn else []
+    serving = _serving_sites(models, settings.encoder) if settings.learn else []
     # The base model loads before anything is printed: it takes seconds, and a checkpoint that
     # will not load must fail the command rather than leave a line promising a proxy that is up.
-    decider = _serve_decider(settings, len(serving))
-    if decider is not None and not settings.lazy_load:
-        if serving:
+    heads, zero_shot = _serve_deciders(settings, len(serving))
+    laya_serves = settings.encoder == LAYA_ENCODER and bool(serving)
+    if not settings.lazy_load:
+        if heads is not None and serving:
             # The first pass through a freshly loaded model is far slower than the rest, so one
             # site pays for it here rather than the first caller of whichever site asks first.
             site, model = serving[0]
-            decider.warm(model, site_dir(models, site) / HEAD_FILE)
-        else:
-            decider.warm_base()
+            heads.warm(model, site_dir(models, site) / HEAD_FILE)
+        if zero_shot is not None and not laya_serves:
+            zero_shot.warm_base()
     # uvicorn.run never returns while the daemon is up, so a piped stdout needs the lines now.
     listening = f"stuntd listening on http://{settings.host}:{settings.port}"
     print(f"{listening} -> {settings.upstream}" if settings.upstream else listening, flush=True)
     jev = "jev proxy" if settings.jev_upstream else "jev local"
     endpoints = [*(["openai", "anthropic"] if settings.upstream else []), jev]
     print(f"endpoints: {', '.join(endpoints)}", flush=True)
-    if decider is not None:
-        served = f"{len(serving)} site(s)" if serving else "jev locally"
-        loading = ", loading on first use" if settings.lazy_load else ""
-        print(f"serving {served} with {settings.base_model}{loading}", flush=True)
+    loading = ", loading on first use" if settings.lazy_load else ""
+    if heads is not None and serving:
+        encoder = settings.base_model if settings.encoder == LAYA_ENCODER else settings.encoder
+        print(f"serving {len(serving)} site(s) with {encoder}{loading}", flush=True)
+    if zero_shot is not None and not laya_serves:
+        print(f"serving jev locally with {settings.base_model}{loading}", flush=True)
     if not settings.learn:
         print("learning off", flush=True)
     pid_file = data_dir() / _PID_FILE
@@ -175,7 +207,9 @@ def _serve(args: argparse.Namespace) -> int:
         # The relay is byte-exact, so uvicorn must not put its own Date and Server headers next
         # to the ones the provider sent.
         uvicorn.run(
-            build_app(settings, decider=decider, config=_config_file(args.config)),
+            build_app(
+                settings, decider=heads, config=_config_file(args.config), zero_shot=zero_shot
+            ),
             host=settings.host,
             port=settings.port,
             log_level="warning",
@@ -321,6 +355,11 @@ def _config_show(args: argparse.Namespace) -> int:
 
 def _make_trainer(settings: Settings) -> Trainer:
     # The only place torch and laya are reached, so every other command runs without the extra.
+    if settings.encoder != LAYA_ENCODER:
+        encoder = resolve_encoder(settings.encoder)
+        from stuntd.train.pooled import PooledTrainer
+
+        return PooledTrainer(encoder, settings.device)
     from stuntd.train.trainer import LayaTrainer
 
     return LayaTrainer(
@@ -341,10 +380,15 @@ def _load_trainer(settings: Settings) -> Trainer:
 
 
 def _base_model_line(settings: Settings) -> str:
+    label, name = (
+        ("base model", settings.base_model)
+        if settings.encoder == LAYA_ENCODER
+        else ("encoder", settings.encoder)
+    )
     # A checkpoint already on disk is read from there, so only a model name is fetched.
-    if Path(settings.base_model).is_dir():
-        return f"base model: {settings.base_model}"
-    return f"base model: {settings.base_model} (downloaded on first use)"
+    if Path(name).is_dir():
+        return f"{label}: {name}"
+    return f"{label}: {name} (downloaded on first use)"
 
 
 def _result_line(result: TrainResult) -> str:
@@ -714,28 +758,32 @@ def _gold_rows(
 ) -> tuple[list[GoldRow], str | None]:
     from stuntd.store.redact import Redactor
 
-    try:
-        decider = _make_decider(settings)
-    except ImportError as exc:
-        raise ValueError(
-            'report --gold needs the train extra: pip install "stuntd[train]"'
-        ) from exc
     # Captures are stored redacted, so a gold text is matched and asked in its redacted form.
     redactor = Redactor(settings.redaction_patterns, builtin=settings.redact)
     teacher, schema = _stored(settings, model.site, redactor)
     local_schema = None
     if not settings.jev_upstream and schema is not None and typed_field(model.site, schema):
         local_schema = schema
+    try:
+        decider, zero_shot_decider = _gold_deciders(
+            settings, model, local_schema is not None and settings.local_fallback == "zeroshot"
+        )
+    except ImportError as exc:
+        raise ValueError(
+            'report --gold needs the train extra: pip install "stuntd[train]"'
+        ) from exc
     head_path = site_dir(models_path(settings), model.site) / HEAD_FILE
     rows = []
     for text, answer in usable:
         redacted = redactor.apply(text)
         verdict = decider.decide(model, head_path, redacted)
         zero_shot = None
-        if local_schema is not None and settings.local_fallback == "zeroshot":
+        if local_schema is not None and zero_shot_decider is not None:
             # laya answers in its own untyped shape, which the decider passes through as object.
             try:
-                reply: Any = decider.answer(redacted, {model.site: laya_question(local_schema)})
+                reply: Any = zero_shot_decider.answer(
+                    redacted, {model.site: laya_question(local_schema)}
+                )
             except RuntimeError as exc:
                 print(f"stuntd: zero-shot failed: {exc}", file=sys.stderr)
             else:
@@ -829,14 +877,18 @@ def _agreement(store: Store, site: str, state: SiteState | None, window: int) ->
     return window_agreement(rows, state.model.threshold).agreement
 
 
-def _mode_label(state: SiteState | None) -> str:
+def _mode_label(state: SiteState | None, encoder: str) -> str:
     if state is None:
         return MODE_COLLECT
+    if state.model is not None and state.model.encoder != encoder:
+        return f"{MODE_COLLECT} ({ENCODER_MISMATCH})"
     return f"{state.mode} (retrained, was live)" if state.was_live else state.mode
 
 
-def _row_without_captures(state: SiteState) -> _SiteStatus:
-    return _SiteStatus(state.site, None, _mode_label(state), 0, 0, 0, None, last_result(state.site))
+def _row_without_captures(state: SiteState, encoder: str) -> _SiteStatus:
+    return _SiteStatus(
+        state.site, None, _mode_label(state, encoder), 0, 0, 0, None, last_result(state.site)
+    )
 
 
 def _status_rows(settings: Settings) -> list[_SiteStatus]:
@@ -847,7 +899,7 @@ def _status_rows(settings: Settings) -> list[_SiteStatus]:
     database = database_path(settings)
     if not database.exists():
         # Opening a store would create the database that status is only here to read.
-        return [_row_without_captures(state) for state in states.values()]
+        return [_row_without_captures(state, settings.encoder) for state in states.values()]
     store = Store(database, Redactor())
     try:
         infos = {info.site: info for info in store.sites()}
@@ -861,7 +913,7 @@ def _status_rows(settings: Settings) -> list[_SiteStatus]:
                 _SiteStatus(
                     site=site,
                     name=None if info is None else info.name,
-                    mode=_mode_label(state),
+                    mode=_mode_label(state, settings.encoder),
                     captures=0 if info is None else info.count,
                     shadow=_compared(decisions),
                     live=decisions.get(MODE_LIVE, 0),

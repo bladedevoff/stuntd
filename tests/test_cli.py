@@ -319,7 +319,16 @@ def test_stop_ends_a_running_daemon(data_dir):
     write_config(data_dir, REMOTE_JEV)
     port = free_port()
     proc = subprocess.Popen(
-        [sys.executable, "-m", "stuntd", "serve", "--port", str(port)],
+        [
+            sys.executable,
+            "-m",
+            "stuntd",
+            "serve",
+            "--port",
+            str(port),
+            "--upstream",
+            "http://127.0.0.1:9",
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
         env={**os.environ, "STUNTD_DATA_DIR": str(data_dir)},
@@ -897,6 +906,257 @@ def test_serve_warms_the_first_serving_site(data_dir, capsys, monkeypatch):
     recorded["app"].state.store.close()
     assert decider.warmed == [("s1", data_dir / "models" / "s1" / HEAD_FILE)]
     assert not decider.warmed_base
+
+
+def test_serve_hands_the_one_decider_to_the_runtime_and_the_question_routes(data_dir, monkeypatch):
+    seed_captures(data_dir)
+    decider = WarmingDecider()
+    recorded = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: recorded.update(app=app))
+    monkeypatch.setattr("stuntd.cli._make_decider", lambda settings: decider)
+    assert main(["serve", "--upstream", "http://127.0.0.1:9"]) == 0
+    recorded["app"].state.store.close()
+    assert recorded["app"].state.runtime._decider is decider
+    assert recorded["app"].state.proxy.zero_shot is decider
+
+
+def stock_encoder(tmp_path, **config):
+    folder = tmp_path / "encoder"
+    folder.mkdir()
+    (folder / "config.json").write_text(
+        json.dumps({"model_type": "bert", **config}), encoding="utf-8"
+    )
+    return folder
+
+
+def use_encoder(data_dir, folder, extra=""):
+    encoder = json.dumps(str(folder))
+    write_config(
+        data_dir, f"[training]\nmin_examples = 4\nholdout = 0.3\nencoder = {encoder}\n{extra}"
+    )
+
+
+def test_serve_does_not_warm_a_head_trained_on_another_encoder(
+    data_dir, tmp_path, capsys, monkeypatch
+):
+    train_site(data_dir, monkeypatch, capsys)
+    use_encoder(data_dir, stock_encoder(tmp_path))
+    decider = WarmingDecider()
+    recorded = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: recorded.update(app=app))
+    monkeypatch.setattr("stuntd.cli._make_decider", lambda settings: decider)
+    assert main(["serve", "--upstream", "http://127.0.0.1:9"]) == 0
+    recorded["app"].state.store.close()
+    assert decider.warmed == []
+    assert decider.warmed_base
+    assert "serving jev locally" in capsys.readouterr().out
+
+
+def serve_with_stock_encoder(
+    data_dir, tmp_path, capsys, monkeypatch, extra="", upstream=("--upstream", "http://127.0.0.1:9")
+):
+    seed_captures(data_dir)
+    use_encoder(data_dir, stock_encoder(tmp_path), extra)
+    monkeypatch.setattr("stuntd.cli._make_trainer", fake_trainer_factory)
+    skip_extra_check(monkeypatch)
+    assert main(["train"]) == 0
+    assert main(["enable", "s1"]) == 0
+    capsys.readouterr()
+    heads, laya, recorded = WarmingDecider(), WarmingDecider(), {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: recorded.update(app=app))
+    monkeypatch.setattr("stuntd.cli._make_pooled_decider", lambda settings, encoder: heads)
+    monkeypatch.setattr("stuntd.cli._make_decider", lambda settings: laya)
+    assert main(["serve", *upstream]) == 0
+    recorded["app"].state.store.close()
+    return heads, laya, recorded["app"], capsys.readouterr().out.splitlines()
+
+
+def test_serve_gives_a_stock_encoder_head_the_pooled_decider_and_zero_shot_to_laya(
+    data_dir, tmp_path, capsys, monkeypatch
+):
+    heads, laya, app, lines = serve_with_stock_encoder(data_dir, tmp_path, capsys, monkeypatch)
+    assert app.state.runtime._decider is heads
+    assert app.state.proxy.zero_shot is laya
+    assert heads.warmed == [("s1", data_dir / "models" / "s1" / HEAD_FILE)]
+    assert not heads.warmed_base
+    assert laya.warmed == [] and laya.warmed_base
+    assert lines[2:] == [
+        f"serving 1 site(s) with {tmp_path / 'encoder'}",
+        "serving jev locally with convaiinnovations/laya",
+    ]
+
+
+def test_serve_gives_zero_shot_to_laya_when_only_the_decisions_endpoint_is_local(
+    data_dir, tmp_path, capsys, monkeypatch
+):
+    heads, laya, app, _ = serve_with_stock_encoder(
+        data_dir, tmp_path, capsys, monkeypatch, REMOTE_JEV, upstream=()
+    )
+    assert app.state.runtime._decider is heads
+    assert app.state.proxy.zero_shot is laya
+
+
+def test_serve_does_not_load_laya_when_nothing_asks_for_zero_shot(
+    data_dir, tmp_path, capsys, monkeypatch
+):
+    heads, laya, app, lines = serve_with_stock_encoder(
+        data_dir, tmp_path, capsys, monkeypatch, REMOTE_JEV
+    )
+    assert app.state.runtime._decider is heads
+    assert app.state.proxy.zero_shot is None
+    assert not laya.warmed_base
+    assert lines[2:] == [f"serving 1 site(s) with {tmp_path / 'encoder'}"]
+
+
+def test_serve_builds_no_pooled_decider_without_a_serving_site(data_dir, tmp_path, monkeypatch):
+    use_encoder(data_dir, stock_encoder(tmp_path))
+    built, laya, recorded = [], WarmingDecider(), {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: recorded.update(app=app))
+    monkeypatch.setattr("stuntd.cli._make_pooled_decider", lambda *args: built.append(args))
+    monkeypatch.setattr("stuntd.cli._make_decider", lambda settings: laya)
+    assert main(["serve", "--upstream", "http://127.0.0.1:9"]) == 0
+    recorded["app"].state.store.close()
+    assert built == []
+    assert laya.warmed_base
+    assert recorded["app"].state.proxy.zero_shot is laya
+
+
+def test_serve_builds_neither_decider_for_a_stock_encoder_nothing_uses(
+    data_dir, tmp_path, monkeypatch
+):
+    use_encoder(data_dir, stock_encoder(tmp_path), REMOTE_JEV)
+    built, recorded = [], {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: recorded.update(app=app))
+    monkeypatch.setattr("stuntd.cli._make_pooled_decider", lambda *args: built.append(args))
+    monkeypatch.setattr("stuntd.cli._make_decider", lambda settings: built.append(settings))
+    assert main(["serve", "--upstream", "http://127.0.0.1:9"]) == 0
+    recorded["app"].state.store.close()
+    assert built == []
+
+
+def test_serve_refuses_an_encoder_that_runs_remote_code(data_dir, tmp_path, capsys, monkeypatch):
+    folder = stock_encoder(tmp_path, auto_map={"AutoModel": "modeling.Custom"})
+    use_encoder(data_dir, folder, REMOTE_JEV)
+    ran = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: ran.append(app))
+    assert main(["serve"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == (
+        f"stuntd: training.encoder {str(folder)!r} needs remote code (auto_map in config.json)\n"
+    )
+    assert captured.out == ""
+    assert ran == []
+
+
+def test_serve_refuses_an_encoder_path_that_does_not_exist(data_dir, tmp_path, capsys, monkeypatch):
+    pytest.importorskip("huggingface_hub")
+    use_encoder(data_dir, tmp_path / "nowhere", REMOTE_JEV)
+    ran = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: ran.append(app))
+    assert main(["serve"]) == 2
+    assert "neither a folder nor a Hugging Face model" in capsys.readouterr().err
+    assert ran == []
+
+
+def test_serve_without_the_pooled_dependencies_reports_serving_disabled(
+    data_dir, tmp_path, capsys, monkeypatch
+):
+    seed_captures(data_dir)
+    use_encoder(data_dir, stock_encoder(tmp_path))
+    monkeypatch.setattr("stuntd.cli._make_trainer", fake_trainer_factory)
+    skip_extra_check(monkeypatch)
+    assert main(["train"]) == 0
+    assert main(["enable", "s1"]) == 0
+    capsys.readouterr()
+    recorded = {}
+
+    def missing(settings, encoder):
+        raise ImportError("No module named 'transformers'")
+
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: recorded.update(app=app))
+    monkeypatch.setattr("stuntd.cli._make_pooled_decider", missing)
+    monkeypatch.setattr("stuntd.cli._make_decider", lambda settings: WarmingDecider())
+    assert main(["serve", "--upstream", "http://127.0.0.1:9"]) == 0
+    recorded["app"].state.store.close()
+    assert 'stuntd: serving disabled: pip install "stuntd[train]"' in capsys.readouterr().err
+
+
+def test_train_refuses_an_encoder_that_runs_remote_code(data_dir, tmp_path, capsys):
+    seed_captures(data_dir)
+    folder = stock_encoder(tmp_path, auto_map={"AutoModel": "modeling.Custom"})
+    use_encoder(data_dir, folder)
+    assert main(["train"]) == 2
+    assert capsys.readouterr().err == (
+        f"stuntd: training.encoder {str(folder)!r} needs remote code (auto_map in config.json)\n"
+    )
+
+
+def test_train_refuses_an_architecture_outside_the_allowlist(data_dir, tmp_path, capsys):
+    seed_captures(data_dir)
+    folder = tmp_path / "decoder"
+    folder.mkdir()
+    (folder / "config.json").write_text('{"model_type": "llama"}', encoding="utf-8")
+    use_encoder(data_dir, folder)
+    assert main(["train"]) == 2
+    assert "has model_type 'llama'" in capsys.readouterr().err
+
+
+def test_train_names_the_stock_encoder_instead_of_the_base_model(
+    data_dir, tmp_path, capsys, monkeypatch
+):
+    seed_captures(data_dir)
+    folder = stock_encoder(tmp_path)
+    use_encoder(data_dir, folder)
+    monkeypatch.setattr("stuntd.cli._make_trainer", fake_trainer_factory)
+    assert main(["train"]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == f"encoder: {folder}"
+
+
+def test_the_stock_encoder_trainer_is_built_from_the_resolved_encoder(tmp_path, monkeypatch):
+    import types
+
+    from stuntd.cli import _make_trainer
+    from stuntd.settings import Settings
+    from stuntd.train.encoders import EncoderSpec
+
+    built = []
+
+    class FakeTrainer:
+        def __init__(self, encoder, device):
+            built.append((encoder, device))
+
+    module = types.ModuleType("stuntd.train.pooled")
+    module.PooledTrainer = FakeTrainer
+    monkeypatch.setitem(sys.modules, "stuntd.train.pooled", module)
+    folder = stock_encoder(tmp_path)
+    _make_trainer(Settings(encoder=str(folder), device="cpu"))
+    assert built == [(EncoderSpec(str(folder), "mean", 512, ""), "cpu")]
+
+
+def test_status_shows_a_head_trained_on_another_encoder_as_collecting(
+    data_dir, capsys, monkeypatch
+):
+    train_site(data_dir, monkeypatch, capsys)
+    skip_extra_check(monkeypatch)
+    assert main(["enable", "s1"]) == 0
+    capsys.readouterr()
+    write_config(data_dir, '[training]\nencoder = "other"\n')
+    assert main(["status", "--json"]) == 0
+    sites = json.loads(capsys.readouterr().out)["sites"]
+    assert [(row["site"], row["mode"]) for row in sites] == [("s1", "collect (encoder-mismatch)")]
+    assert main(["status"]) == 0
+    assert "collect (encoder-mismatch)" in capsys.readouterr().out
+
+
+def test_status_shows_a_head_trained_on_another_encoder_without_a_database(
+    data_dir, capsys, monkeypatch
+):
+    train_site(data_dir, monkeypatch, capsys)
+    (data_dir / "captures.sqlite").unlink()
+    write_config(data_dir, '[training]\nencoder = "other"\n')
+    assert main(["status", "--json"]) == 0
+    sites = json.loads(capsys.readouterr().out)["sites"]
+    assert [row["mode"] for row in sites] == ["collect (encoder-mismatch)"]
 
 
 def test_serve_warms_nothing_when_every_site_collects(data_dir, capsys, monkeypatch):

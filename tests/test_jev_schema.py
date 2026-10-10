@@ -242,6 +242,8 @@ def test_choice_with_the_maximum_options_is_parsed():
     [
         (b"not json", "request body must be valid JSON"),
         (b'\xff{"state": "s"}', "request body must be valid JSON"),
+        (b'{"state": "a\\ud800b"}', "request body must be valid JSON"),
+        (b"[" * 200_000, "request body must be valid JSON"),
         (b'["state"]', "request body must be a JSON object"),
         (b'{"model": "m", "questions": {}}', "request must contain state"),
         (
@@ -255,6 +257,8 @@ def test_choice_with_the_maximum_options_is_parsed():
     ids=[
         "not-json",
         "bad-utf8",
+        "lone-surrogate",
+        "deeply-nested",
         "not-object",
         "no-state",
         "numeric-state",

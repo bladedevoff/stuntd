@@ -110,6 +110,7 @@ async def proxy(data_dir):
             Settings(upstream="http://upstream", learn=False, **overrides),
             transport=httpx.ASGITransport(app=upstream),
             decider=decider,
+            zero_shot=decider,
         )
         apps.append(app)
         return app

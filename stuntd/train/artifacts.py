@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from stuntd.paths import private_dir, write_private
+from stuntd.settings import LAYA_ENCODER
 from stuntd.train.metrics import ClassStats, ConfidentError, Interval, Operating
 
 __all__ = [
@@ -60,6 +61,7 @@ class SiteModel:
     n_covered: int | None = None
     novelty_cutoff: float | None = None
     familiar_share: float | None = None
+    encoder: str = LAYA_ENCODER
 
 
 def site_dir(models: Path, site: str) -> Path:
@@ -120,6 +122,7 @@ def _from_dict(raw: dict[str, Any]) -> SiteModel:
         n_covered=raw.get("n_covered"),
         novelty_cutoff=raw.get("novelty_cutoff"),
         familiar_share=raw.get("familiar_share"),
+        encoder=raw.get("encoder", LAYA_ENCODER),
     )
 
 

@@ -216,6 +216,17 @@ async def test_multi_field_field_not_live_sends_the_request_to_the_provider(serv
     assert captured(app) == {f"{SITE}.category": 1, f"{SITE}.urgent": 1}
 
 
+async def test_multi_field_heads_trained_on_another_encoder_send_the_request_to_the_provider(
+    serving,
+):
+    provider = Provider()
+    app = serving(provider, SURE, encoder="other")
+    response = await post(app)
+    assert provider.calls == 1
+    assert response.headers["x-stuntd"] == f"collect; site={SITE}; reason=encoder-mismatch:category"
+    assert app.state.proxy.decider.calls == []
+
+
 async def test_multi_field_shadow_fields_record_how_the_model_compared(serving):
     app = serving(Provider(), SURE, modes=(MODE_SHADOW, MODE_SHADOW))
     response = await post(app)

@@ -16,6 +16,7 @@ else:
 
 __all__ = [
     "CONFIG_TEMPLATE",
+    "LAYA_ENCODER",
     "Settings",
     "config_path",
     "database_path",
@@ -57,6 +58,10 @@ CONFIG_TEMPLATE = """# stuntd settings. Every key is optional; a missing key kee
 # Agreement with the provider the trained model must reach before it is used.
 # target_agreement = 0.99
 # base_model = "convaiinnovations/laya"
+# Encoder the heads are trained on and served with: "laya", or the Hugging Face id or local folder
+# of a sentence encoder. A head only serves while this names the encoder it was trained on.
+# encoder = "laya"
+# Passes over the training examples; a stock sentence encoder trains with its own fixed count.
 # epochs = 3
 # device = "auto"                # auto, cpu, cuda or mps
 # Whether the frozen encoder runs once per example instead of once per epoch; off re-encodes.
@@ -102,12 +107,17 @@ CONFIG_TEMPLATE = """# stuntd settings. Every key is optional; a missing key kee
 # Origin of the Jev provider answers are fetched from: the origin only, no path. Left empty, the
 # base Laya answers locally instead.
 # upstream = ""
+# Path the Jev provider serves System One on, for providers that do not use /v1/systemone.
+# path = "/v1/systemone"
 # Whether a Jev request must carry a Bearer token; the token itself is not checked.
 # require_key = false
 # Name reported in the model field of a Jev answer.
 # model_name = "stuntd"
 """
 """The commented stuntd.toml written for a fresh installation."""
+
+LAYA_ENCODER = "laya"
+"""The encoder name of the Laya checkpoint, which every head written before 0.2 was trained on."""
 
 _DEFAULT_DB_NAME = "captures.sqlite"
 _DEFAULT_MODELS_NAME = "models"
@@ -126,6 +136,7 @@ _SECTIONS = {
         "holdout": float,
         "target_agreement": float,
         "base_model": str,
+        "encoder": str,
         "epochs": int,
         "device": str,
         "cache_encoder": bool,
@@ -146,13 +157,14 @@ _SECTIONS = {
         "novelty_gate": bool,
         "local_fallback": str,
     },
-    "jev": {"upstream": str, "require_key": bool, "model_name": str},
+    "jev": {"upstream": str, "path": str, "require_key": bool, "model_name": str},
 }
 
 _FIELD_KEYS = {
     "redact": "redaction.enabled",
     "redaction_patterns": "redaction.patterns",
     "jev_upstream": "jev.upstream",
+    "jev_path": "jev.path",
     "jev_require_key": "jev.require_key",
     "jev_model_name": "jev.model_name",
 }
@@ -203,8 +215,12 @@ class Settings:
     base_model: str = "convaiinnovations/laya"
     """Model the per-site models are trained from."""
 
+    encoder: str = LAYA_ENCODER
+    """Encoder heads are trained on and served with: laya, or the Hugging Face id or local folder
+    of a sentence encoder."""
+
     epochs: int = 3
-    """Passes over the training examples."""
+    """Passes over the training examples of a Laya head; a stock encoder uses its own fixed count."""
 
     device: str = "auto"
     """Device training runs on: auto, cpu, cuda or mps."""
@@ -262,6 +278,9 @@ class Settings:
     jev_upstream: str = ""
     """Origin of the Jev provider; empty means the base Laya answers locally."""
 
+    jev_path: str = "/v1/systemone"
+    """Path the Jev provider serves System One on; only the relay to it uses this."""
+
     jev_require_key: bool = False
     """Whether a Jev request must carry a Bearer token; the token itself is not checked."""
 
@@ -313,6 +332,11 @@ def _check_jev_upstream(url: str) -> None:
         or parts.fragment
     ):
         raise ValueError(message)
+
+
+def _check_jev_path(path: str) -> None:
+    if not path.startswith("/") or path.startswith("//") or "?" in path or "#" in path:
+        raise ValueError(f"jev.path must be an absolute path like /v1/systemone, got {path!r}")
 
 
 def setting_key(field_name: str) -> str:
@@ -378,6 +402,7 @@ def load_settings(path: Path | None = None, overrides: dict[str, Any] | None = N
     settings.holdout = values.get("training.holdout", settings.holdout)
     settings.target_agreement = values.get("training.target_agreement", settings.target_agreement)
     settings.base_model = values.get("training.base_model", settings.base_model)
+    settings.encoder = values.get("training.encoder", settings.encoder)
     settings.epochs = values.get("training.epochs", settings.epochs)
     settings.device = values.get("training.device", settings.device)
     settings.cache_encoder = values.get("training.cache_encoder", settings.cache_encoder)
@@ -403,6 +428,7 @@ def load_settings(path: Path | None = None, overrides: dict[str, Any] | None = N
     settings.local_fallback = values.get("serving.local_fallback", settings.local_fallback)
     settings.learn = values.get("learn", settings.learn)
     settings.jev_upstream = values.get("jev.upstream", settings.jev_upstream)
+    settings.jev_path = values.get("jev.path", settings.jev_path)
     settings.jev_require_key = values.get("jev.require_key", settings.jev_require_key)
     settings.jev_model_name = values.get("jev.model_name", settings.jev_model_name)
     if overrides:
@@ -426,6 +452,8 @@ def load_settings(path: Path | None = None, overrides: dict[str, Any] | None = N
         raise ValueError(
             f"target_agreement must be above 0 and at most 1, got {settings.target_agreement!r}"
         )
+    if not settings.encoder:
+        raise ValueError("encoder cannot be empty")
     if settings.epochs < 1:
         raise ValueError(f"epochs must be at least 1, got {settings.epochs!r}")
     if settings.cache_max_mb < 0:
@@ -471,6 +499,7 @@ def load_settings(path: Path | None = None, overrides: dict[str, Any] | None = N
         )
     if settings.jev_upstream:
         _check_jev_upstream(settings.jev_upstream)
+    _check_jev_path(settings.jev_path)
     if not _MODEL_NAME.fullmatch(settings.jev_model_name):
         raise ValueError(
             f"jev.model_name must be 1 to 64 letters, digits, dot, dash or underscore, "

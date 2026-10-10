@@ -6,6 +6,7 @@ from bisect import bisect_left
 from collections.abc import Sequence
 from dataclasses import asdict
 
+from stuntd.settings import LAYA_ENCODER
 from stuntd.train.artifacts import SiteModel
 from stuntd.train.metrics import ConfidentError, Interval, Operating
 
@@ -35,9 +36,11 @@ def _interval(interval: Interval | None, rows: int | None) -> str:
 
 def _headline(model: SiteModel) -> list[str]:
     trained = time.strftime(TIME_FORMAT, time.localtime(model.trained_at))
+    base = (
+        f"base {model.base_model}" if model.encoder == LAYA_ENCODER else f"encoder {model.encoder}"
+    )
     lines = [
-        f"site {model.site}  {model.kind} {model.field}"
-        f"  trained {trained}  base {model.base_model}",
+        f"site {model.site}  {model.kind} {model.field}  trained {trained}  {base}",
         f"examples: {model.n_train} train, {model.n_holdout} holdout",
         f"holdout agreement {model.agreement:.3f}"
         f"{_interval(model.agreement_interval, model.n_holdout)}  ece {model.ece:.3f}"

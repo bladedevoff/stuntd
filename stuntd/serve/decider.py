@@ -12,6 +12,7 @@ import torch
 from laya.common import collate_items
 from safetensors.torch import load_file
 
+from stuntd.serve.heads import HEAD_CACHE_SIZE, Verdict
 from stuntd.train.artifacts import EMBEDDINGS_FILE, SiteModel
 from stuntd.train.layout import Layout
 from stuntd.train.metrics import confidence, softmax
@@ -19,9 +20,6 @@ from stuntd.train.novelty import novelty, pool_hidden
 from stuntd.train.trainer import site_row
 
 __all__ = ["HEAD_CACHE_SIZE", "Decider", "Verdict"]
-
-HEAD_CACHE_SIZE = 4
-"""Heads kept in memory at once, dropping the one left unused longest."""
 
 _HEAD_PREFIXES = ("head.", "scorer.", "type_emb.")
 
@@ -48,19 +46,6 @@ _HeadKey = tuple[Path, int]
 class _Head:
     weights: dict[str, torch.Tensor]
     embeddings: torch.Tensor | None
-
-
-@dataclass(frozen=True)
-class Verdict:
-    """One answer from a site's head: the label it chose, every label's probability, how sure it
-    is, how long it took, and how far the request is from the rows the head trained on, when the
-    head kept them."""
-
-    label: int
-    confidence: float
-    latency_ms: int
-    probabilities: tuple[float, ...]
-    novelty: float | None = None
 
 
 class Decider:

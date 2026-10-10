@@ -107,6 +107,15 @@ def test_the_trainer_layout_is_written_into_the_metadata(store):
     assert (model.max_len, model.head_max_len, model.spaced_labels) == (700, 380, True)
 
 
+def test_the_configured_encoder_is_written_into_the_metadata(store):
+    laya = train_sites(store, settings(), perfect_trainer, sites=["s1"])[0].model
+    stock = Settings(min_examples=4, holdout=0.3, target_agreement=0.9, encoder="local/e5")
+    trained = train_sites(store, stock, perfect_trainer, sites=["s1"])[0].model
+    assert laya is not None and laya.encoder == "laya"
+    assert trained is not None and trained.encoder == "local/e5"
+    assert load_model(models_path(stock), "s1").encoder == "local/e5"
+
+
 def test_only_named_sites_are_trained(store):
     results = train_sites(store, settings(), perfect_trainer, sites=["s1", "ghost"])
     assert [(r.site, r.model is not None, r.reason) for r in results] == [

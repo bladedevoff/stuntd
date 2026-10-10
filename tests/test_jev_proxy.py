@@ -332,6 +332,27 @@ async def test_a_shadow_site_compares_its_head_with_the_provider_answer(proxying
     assert captures(app, "site, answer") == [("tone", "angry")]
 
 
+@pytest.mark.parametrize("mode", [MODE_LIVE, MODE_SHADOW], ids=["live", "shadow"])
+async def test_a_head_trained_on_another_encoder_leaves_the_question_to_the_provider(
+    proxying, mode
+):
+    provider = Provider()
+    app = proxying(
+        transport_for(provider),
+        model=replace(site_model("tone"), encoder="other"),
+        mode=mode,
+        decider=FakeDecider(),
+    )
+    response = await post(app, {"tone": TONE})
+    assert provider.calls == 1
+    assert response.content == PROVIDER_BODY
+    assert response.headers["x-stuntd"] == (
+        "jev; mode=proxy; questions=1; live=0; shadow=0; check=0; reason=encoder-mismatch"
+    )
+    assert app.state.store.decisions("tone", 10) == []
+    assert captures(app, "site, answer") == [("tone", "angry")]
+
+
 async def test_an_unreachable_provider_is_reported(proxying):
     app = proxying(Unreachable())
     response = await post(app, {"billing": BILLING})

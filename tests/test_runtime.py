@@ -125,6 +125,27 @@ def test_state_follows_the_mode_file_after_it_changes(models, store):
     assert runtime.state("s1").mode == MODE_LIVE
 
 
+def test_state_of_a_head_trained_on_another_encoder_is_collect(models, store, caplog):
+    folder = save_model(models, replace(model(), encoder="other"))
+    write_mode(folder, MODE_LIVE, now=NOW)
+    runtime = runtime_for(models, store)
+    with caplog.at_level(logging.WARNING):
+        states = [runtime.state("s1") for _ in range(2)]
+    assert [(state.mode, state.model is not None) for state in states] == [(MODE_COLLECT, True)] * 2
+    assert runtime.state_reason("s1") == "encoder-mismatch"
+    assert caplog.text.count("s1 was trained with encoder 'other', training.encoder is 'laya'") == 1
+
+
+def test_state_of_a_head_trained_on_the_configured_encoder_is_served(models, store, caplog):
+    folder = save_model(models, replace(model(), encoder="other"))
+    write_mode(folder, MODE_LIVE, now=NOW)
+    runtime = runtime_for(models, store, encoder="other")
+    with caplog.at_level(logging.WARNING):
+        assert runtime.state("s1").mode == MODE_LIVE
+    assert runtime.state_reason("s1") is None
+    assert caplog.text == ""
+
+
 def test_state_falls_back_to_collect_once_a_file_is_torn(models, store, caplog):
     folder = save_model(models, model())
     write_mode(folder, MODE_LIVE, now=1.0)

@@ -129,6 +129,7 @@ def _evaluate(
         field=dataset.field,
         labels=list(dataset.labels),
         base_model=settings.base_model,
+        encoder=settings.encoder,
         temperature=temperature,
         threshold=None if point is None else point.threshold,
         target_agreement=settings.target_agreement,

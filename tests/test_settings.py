@@ -269,7 +269,20 @@ def test_a_negative_cache_budget_is_refused(tmp_path):
         load_settings(cfg)
 
 
+def test_encoder_defaults_to_laya_and_comes_from_the_file(tmp_path):
+    assert Settings().encoder == "laya"
+    cfg = tmp_path / "stuntd.toml"
+    cfg.write_text('[training]\nencoder = "intfloat/multilingual-e5-base"\n', encoding="utf-8")
+    assert load_settings(cfg).encoder == "intfloat/multilingual-e5-base"
+
+
+def test_an_empty_encoder_is_rejected():
+    with pytest.raises(ValueError, match="encoder cannot be empty"):
+        load_settings(None, {"upstream": "http://up", "encoder": ""})
+
+
 def test_template_documents_training():
+    assert '# encoder = "laya"' in CONFIG_TEMPLATE
     assert "[training]" in CONFIG_TEMPLATE and "# target_agreement = 0.99" in CONFIG_TEMPLATE
     assert "# cache_encoder = true" in CONFIG_TEMPLATE
     assert "# cache_max_mb = 0" in CONFIG_TEMPLATE
@@ -300,15 +313,20 @@ def test_jev_section_is_read(tmp_path):
     cfg = tmp_path / "stuntd.toml"
     cfg.write_text(
         'upstream = "http://up"\nlearn = false\n'
-        '[jev]\nupstream = "https://api.typesafe.ai"\nrequire_key = true\n'
-        'model_name = "stuntd-1.0"\n',
+        '[jev]\nupstream = "https://api.typesafe.ai"\npath = "/v1/decisions"\n'
+        'require_key = true\nmodel_name = "stuntd-1.0"\n',
         encoding="utf-8",
     )
     settings = load_settings(cfg)
     assert settings.learn is False
     assert settings.jev_upstream == "https://api.typesafe.ai"
+    assert settings.jev_path == "/v1/decisions"
     assert settings.jev_require_key is True
     assert settings.jev_model_name == "stuntd-1.0"
+
+
+def test_the_jev_path_defaults_to_system_one():
+    assert Settings().jev_path == "/v1/systemone"
 
 
 @pytest.mark.parametrize(
@@ -338,6 +356,18 @@ def test_jev_section_is_read(tmp_path):
             "jev.upstream must be an origin like https://api.typesafe.ai, got 'https://[::1'",
         ),
         (
+            '[jev]\npath = "v1/decisions"\n',
+            "jev.path must be an absolute path like /v1/systemone, got 'v1/decisions'",
+        ),
+        (
+            '[jev]\npath = "/v1/decisions?key=1"\n',
+            "jev.path must be an absolute path like /v1/systemone, got '/v1/decisions?key=1'",
+        ),
+        (
+            '[jev]\npath = "//other-host/v1"\n',
+            "jev.path must be an absolute path like /v1/systemone, got '//other-host/v1'",
+        ),
+        (
             '[jev]\nmodel_name = "my model"\n',
             "jev.model_name must be 1 to 64 letters, digits, dot, dash or underscore, "
             "got 'my model'",
@@ -350,6 +380,9 @@ def test_jev_section_is_read(tmp_path):
         "upstream-with-query",
         "upstream-with-userinfo",
         "upstream-with-broken-ipv6",
+        "path-not-absolute",
+        "path-with-query",
+        "path-with-host",
         "model-name-with-space",
         "learn-not-bool",
     ],
@@ -364,6 +397,7 @@ def test_jev_values_are_rejected(tmp_path, body, message):
 def test_template_documents_jev():
     assert "# learn = true" in CONFIG_TEMPLATE
     assert "[jev]" in CONFIG_TEMPLATE and '# model_name = "stuntd"' in CONFIG_TEMPLATE
+    assert '# path = "/v1/systemone"' in CONFIG_TEMPLATE
 
 
 @pytest.mark.parametrize(

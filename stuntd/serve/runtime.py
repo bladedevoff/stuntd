@@ -38,7 +38,18 @@ from stuntd.train.artifacts import HEAD_FILE, META_FILE, SiteModel, site_dir
 if TYPE_CHECKING:
     from stuntd.serve.decider import Verdict
 
-__all__ = ["DeciderLike", "Outcome", "Runtime", "input_hash", "is_novel"]
+__all__ = [
+    "ENCODER_MISMATCH",
+    "HeadDecider",
+    "Outcome",
+    "Runtime",
+    "ZeroShot",
+    "input_hash",
+    "is_novel",
+]
+
+ENCODER_MISMATCH = "encoder-mismatch"
+"""Why a site with a head is served as if it had none: the head was trained on another encoder."""
 
 _log = logging.getLogger(__name__)
 
@@ -56,17 +67,21 @@ _Stamp = tuple[int, int]
 _Stamps = tuple[_Stamp, _Stamp | None]
 
 
-class DeciderLike(Protocol):
-    """What serving needs of a decider: an answer from a site's head, a batch of zero-shot answers,
-    and a pass to warm a head or the base checkpoint."""
+class HeadDecider(Protocol):
+    """What serving needs to answer from a site's head: a decision and a pass to warm the head."""
 
     def decide(self, model: SiteModel, head_path: Path, text: str) -> Verdict: ...
+
+    def warm(self, model: SiteModel, head_path: Path) -> None: ...
+
+
+class ZeroShot(Protocol):
+    """What a question route needs to answer without a head: a batch of zero-shot answers and a
+    pass to warm the base checkpoint."""
 
     def answer(
         self, state: object, questions: dict[str, dict[str, object]]
     ) -> dict[str, object]: ...
-
-    def warm(self, model: SiteModel, head_path: Path) -> None: ...
 
     def warm_base(self) -> None: ...
 
@@ -91,7 +106,7 @@ class Runtime:
         self,
         settings: Settings,
         store: Store,
-        decider: DeciderLike | None,
+        decider: HeadDecider | None,
         now: Callable[[], float] = time.time,
     ) -> None:
         self._settings = settings
@@ -101,6 +116,7 @@ class Runtime:
         self._models = models_path(settings)
         self._states: dict[str, tuple[_Stamps, SiteState]] = {}
         self._unreadable: set[str] = set()
+        self._mismatched: set[str] = set()
         self._cache: OrderedDict[str, Verdict] = OrderedDict()
 
     def __repr__(self) -> str:
@@ -110,34 +126,29 @@ class Runtime:
         )
 
     def state(self, site: str) -> SiteState:
-        """One site's mode and model, re-read only once the files behind them change."""
-        folder = site_dir(self._models, site)
-        stamps = _stamps(folder)
-        if stamps is None:
-            return SiteState(site, MODE_COLLECT, None, None)
-        cached = self._states.get(site)
-        if cached is not None and cached[0] == stamps:
-            return cached[1]
-        # Training and the mode switches rewrite these two files, so their timestamps are what
-        # tells a state still worth reusing from one the daemon must read again.
-        try:
-            state = site_state(self._models, site)
-        except (ValueError, OSError):
-            # A half-written file would otherwise turn every request for this site into a bare
-            # 500, and the provider can still answer them all.
-            if site not in self._unreadable:
-                self._unreadable.add(site)
-                _log.exception("%s state unreadable", site)
-            return SiteState(site, MODE_COLLECT, None, None)
-        self._unreadable.discard(site)
-        self._states[site] = (stamps, state)
-        if state.was_live:
-            _log.warning("%s was retrained while live and is back in shadow", site)
-        return state
+        """One site's mode and model, re-read only once the files behind them change; a head
+        trained on another encoder than training.encoder collects, whatever mode it was left in."""
+        state = self._read_state(site)
+        model = state.model
+        if model is None or model.encoder == self._settings.encoder:
+            self._mismatched.discard(site)
+            return state
+        if site not in self._mismatched:
+            self._mismatched.add(site)
+            _log.warning(
+                "%s was trained with encoder %r, training.encoder is %r: it collects until"
+                " retrained",
+                site,
+                model.encoder,
+                self._settings.encoder,
+            )
+        return replace(state, mode=MODE_COLLECT)
 
     def state_reason(self, site: str) -> str | None:
         """Why a site collects although it has a model, for the header to carry, or None."""
-        return _STATE_ERROR if site in self._unreadable else None
+        if site in self._unreadable:
+            return _STATE_ERROR
+        return ENCODER_MISMATCH if site in self._mismatched else None
 
     async def shadow(self, state: SiteState, text: str, big_answer: str) -> None:
         """Runs the model beside the provider and records whether the two agreed."""
@@ -341,11 +352,36 @@ class Runtime:
             return False
         return True
 
-    async def _decide(self, decider: DeciderLike, model: SiteModel, text: str) -> Verdict:
+    async def _decide(self, decider: HeadDecider, model: SiteModel, text: str) -> Verdict:
         head_path = site_dir(self._models, model.site) / HEAD_FILE
         # Captures are stored redacted, so the head learned redacted text; the cache and the
         # check sample still key on the caller's own text.
         return await to_thread.run_sync(decider.decide, model, head_path, self._store.redact(text))
+
+    def _read_state(self, site: str) -> SiteState:
+        folder = site_dir(self._models, site)
+        stamps = _stamps(folder)
+        if stamps is None:
+            return SiteState(site, MODE_COLLECT, None, None)
+        cached = self._states.get(site)
+        if cached is not None and cached[0] == stamps:
+            return cached[1]
+        # Training and the mode switches rewrite these two files, so their timestamps are what
+        # tells a state still worth reusing from one the daemon must read again.
+        try:
+            state = site_state(self._models, site)
+        except (ValueError, OSError):
+            # A half-written file would otherwise turn every request for this site into a bare
+            # 500, and the provider can still answer them all.
+            if site not in self._unreadable:
+                self._unreadable.add(site)
+                _log.exception("%s state unreadable", site)
+            return SiteState(site, MODE_COLLECT, None, None)
+        self._unreadable.discard(site)
+        self._states[site] = (stamps, state)
+        if state.was_live:
+            _log.warning("%s was retrained while live and is back in shadow", site)
+        return state
 
     def _retrained(self, site: str) -> bool:
         cached = self._states.get(site)

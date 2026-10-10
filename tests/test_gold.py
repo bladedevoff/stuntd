@@ -294,6 +294,45 @@ def test_report_gold_in_local_mode_sends_a_novel_request_to_the_fallback(
     assert score["served_accuracy"] == pytest.approx(2 / 3)
 
 
+def test_report_gold_scores_a_stock_encoder_head_with_the_pooled_decider(
+    data_dir, gold, capsys, monkeypatch
+):
+    save_model(data_dir / "models", replace(site_model(), encoder="intfloat/multilingual-e5-base"))
+    heads = FakeDecider(
+        {"user: a": ("deny", 0.9), "user: b": ("deny", 0.5), "user: mail [email]": ("refund", 0.95)}
+    )
+    built = []
+
+    def pooled(settings, encoder):
+        built.append(encoder.name)
+        return heads
+
+    monkeypatch.setattr("stuntd.cli._make_pooled_decider", pooled)
+    monkeypatch.setattr("stuntd.cli._make_decider", lambda settings: pytest.fail("laya loaded"))
+    monkeypatch.setattr("stuntd.cli.resolve_encoder", lambda name: SimpleNamespace(name=name))
+    record(data_dir, ("user: a", "refund"))
+    assert main(["report", "s1", "--gold", gold]) == 0
+    assert built == ["intfloat/multilingual-e5-base"]
+    assert heads.asked == ["user: a", "user: b", "user: mail [email]"]
+
+
+def test_report_gold_asks_laya_for_the_zero_shot_fallback_of_a_stock_encoder_head(
+    data_dir, gold, capsys, monkeypatch
+):
+    save_model(data_dir / "models", replace(site_model(), encoder="intfloat/multilingual-e5-base"))
+    heads = FakeDecider(
+        {"user: a": ("deny", 0.9), "user: b": ("deny", 0.5), "user: mail [email]": ("refund", 0.95)}
+    )
+    laya = FakeDecider({}, {"user: a": "refund", "user: b": "refund", "user: mail [email]": "deny"})
+    monkeypatch.setattr("stuntd.cli._make_pooled_decider", lambda settings, encoder: heads)
+    monkeypatch.setattr("stuntd.cli._make_decider", lambda settings: laya)
+    monkeypatch.setattr("stuntd.cli.resolve_encoder", lambda name: SimpleNamespace(name=name))
+    record(data_dir, ("user: a", "refund"), schema=JEV_CANONICAL)
+    assert main(["report", "s1", "--gold", gold]) == 0
+    assert laya.questions == [{"s1": JEV_QUESTION}] * 3
+    assert laya.asked == []
+
+
 def test_report_gold_with_a_jev_provider_scores_the_teacher(
     data_dir, trained, decider, gold, capsys
 ):

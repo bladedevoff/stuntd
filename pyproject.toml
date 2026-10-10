@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stuntd"
-version = "0.1.4"
-description = "Local proxy that learns your app's typed LLM decisions and answers them with a Laya head. Jev and OpenAI compatible."
+version = "0.2.0"
+description = "Local proxy that learns your app's typed LLM decisions and answers them with a Laya head. Jev, OpenAI Decisions and OpenAI compatible."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -42,12 +42,13 @@ Issues = "https://github.com/bladedevoff/stuntd/issues"
 stuntd = "stuntd.cli:main"
 
 [tool.setuptools]
-packages = ["stuntd", "stuntd.proxy", "stuntd.decisions", "stuntd.jev", "stuntd.serve", "stuntd.store", "stuntd.train"]
+packages = ["stuntd", "stuntd.proxy", "stuntd.decisions", "stuntd.jev", "stuntd.oai", "stuntd.serve", "stuntd.store", "stuntd.train"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 addopts = "-rXs --strict-config --strict-markers"
-markers = ["slow: real Laya training on a local checkpoint named by STUNTD_LAYA_MODEL"]
+markers = ["slow: real training on a local Laya checkpoint named by STUNTD_LAYA_MODEL or a stock encoder in the Hugging Face cache"]
 xfail_strict = true
 filterwarnings = ["error"]
 

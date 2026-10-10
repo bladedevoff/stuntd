@@ -230,6 +230,21 @@ async def test_shadow_decision_failure_leaves_the_response_untouched(serving, ca
     assert "shadow decision failed" in caplog.text
 
 
+@pytest.mark.parametrize("mode", [MODE_SHADOW, MODE_LIVE], ids=["shadow", "live"])
+async def test_site_trained_on_another_encoder_goes_to_the_provider(serving, mode):
+    provider = Provider()
+    decider = FakeDecider()
+    app = serving(
+        provider, site_model=replace(model(), encoder="other"), mode=mode, decider=decider
+    )
+    response = await post(app)
+    assert response.content == UPSTREAM_BODY
+    assert response.headers["x-stuntd"] == f"collect; site={SITE}; reason=encoder-mismatch"
+    assert provider.calls == 1 and decider.calls == []
+    assert [(row["site"], row["count"]) for row in app.state.store.stats()] == [(SITE, 1)]
+    assert app.state.store.decisions(SITE, 10) == []
+
+
 async def test_site_whose_state_cannot_be_read_still_collects(serving, caplog):
     provider = Provider()
     app = serving(provider, site_model=model(), mode=MODE_LIVE, decider=FakeDecider())
