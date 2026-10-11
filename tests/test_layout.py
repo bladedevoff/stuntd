@@ -22,7 +22,7 @@ class WordTokenizer:
     mask_token = "[MASK]"
     pad_token_id, mask_token_id, cls_token_id, sep_token_id = 0, 1, 2, 3
 
-    def __call__(self, text, add_special_tokens=False):
+    def __call__(self, text, add_special_tokens=False, **kwargs):
         return {"input_ids": [zlib.crc32(word.encode()) + 4 for word in text.split()]}
 
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stuntd"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local proxy that learns your app's typed LLM decisions and answers them with a Laya head. Jev, OpenAI Decisions and OpenAI compatible."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,7 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "anyio>=4", "ruff>=0.6", "mypy>=1.10", "hypothesis>=6.100", "mutmut>=3", "pyright>=1.1.380", "typesafe-sdk>=0.7", "anthropic>=0.40"]
-train = ["laya>=0.3.4"]
+train = ["laya>=0.3.4,<0.5"]
 jev = ["typesafe-sdk>=0.7"]
 
 [project.urls]
@@ -50,7 +50,11 @@ pythonpath = ["."]
 addopts = "-rXs --strict-config --strict-markers"
 markers = ["slow: real training on a local Laya checkpoint named by STUNTD_LAYA_MODEL or a stock encoder in the Hugging Face cache"]
 xfail_strict = true
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # laya 0.4 warns that the base checkpoint ships temperatures out of range; the tests use it as shipped.
+    "ignore:laya. this checkpoint ships invalid temperatures:RuntimeWarning",
+]
 
 [tool.ruff]
 line-length = 100

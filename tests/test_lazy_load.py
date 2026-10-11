@@ -10,6 +10,7 @@ Decider = pytest.importorskip("stuntd.serve.decider").Decider
 class FakeAgent:
     loads = 0
     fail = False
+    asked: list = []
 
     def __init__(self, checkpoint, device=None):
         time.sleep(0.05)
@@ -19,6 +20,7 @@ class FakeAgent:
         self.model = torch.nn.Linear(1, 1)
 
     def system_one(self, state, questions):
+        type(self).asked.append(questions)
         return {"answers": {}, "usage": {}}
 
 
@@ -26,6 +28,7 @@ class FakeAgent:
 def agent(monkeypatch):
     FakeAgent.loads = 0
     FakeAgent.fail = False
+    FakeAgent.asked = []
     monkeypatch.setattr("stuntd.serve.decider.laya.Agent", FakeAgent)
     return FakeAgent
 
@@ -65,3 +68,9 @@ def test_lazy_decider_retries_after_a_failed_load(agent):
     agent.fail = False
     assert decider.answer("state", {}) == {"answers": {}, "usage": {}}
     assert agent.loads == 2
+
+
+def test_the_warm_up_question_has_instructions(agent):
+    Decider("base").warm_base()
+    [questions] = agent.asked
+    assert all(question["instructions"].strip() for question in questions.values())

@@ -36,3 +36,18 @@ jobs:
       - run: ruff check .
       - run: mypy stuntd
       - run: pyright stuntd
+
+  train:
+    name: tests with the train extra (newest laya)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      # The CPU build of torch keeps the job's download small; the train extra then brings laya.
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -e ".[dev,train]"
+      - run: pip show laya
+      - run: pytest -v

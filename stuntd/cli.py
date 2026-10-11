@@ -782,7 +782,7 @@ def _gold_rows(
             # laya answers in its own untyped shape, which the decider passes through as object.
             try:
                 reply: Any = zero_shot_decider.answer(
-                    redacted, {model.site: laya_question(local_schema)}
+                    redacted, {model.site: laya_question(local_schema, model.site)}
                 )
             except RuntimeError as exc:
                 print(f"stuntd: zero-shot failed: {exc}", file=sys.stderr)

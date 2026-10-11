@@ -29,7 +29,7 @@ Three ways to run it:
 - **In front of the paid Jev API.** stuntd relays, learns from the provider's own answers, and
   takes the decision over once its head is right often enough.
 
-Status: early release, v0.2.0. Every number below traces to a demo in this repository or to a source
+Status: early release, v0.2.1. Every number below traces to a demo in this repository or to a source
 listed at the end.
 
 ## Who it is for
@@ -838,7 +838,8 @@ coverage 0.57. If your decision is really a calculation, write the calculation, 
   site and every epoch reads its cached output, so the extra epochs cost seconds, not minutes.
   At 3 epochs the same sites answer almost nothing.
 - **`score` takes 2 to 10 levels and `choice` takes at most 255 options.** Those are stuntd's own
-  limits, not a quotation from the Jev API. `instructions` is optional on a question.
+  limits, not a quotation from the Jev API. `instructions` is optional on a question; locally,
+  zero-shot Laya is asked a question without them by its name.
 - **A question name is a decision site.** `:` becomes `.`, so `a:b` and `a.b` are one site. Two
   questions with the same name but different criteria train one head on mixed data; give them
   different names.

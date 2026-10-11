@@ -387,7 +387,7 @@ async def test_a_question_without_instructions_or_criteria_is_answered(serving):
     response = await post(app, {"billing": BILLING})
     assert response.status_code == 200
     assert json.loads(response.content)["answers"] == {"billing": NOUL_ANSWER}
-    assert decider.batches == [{"billing": {"type": "noul", "instructions": ""}}]
+    assert decider.batches == [{"billing": {"type": "noul", "instructions": "billing"}}]
 
 
 async def test_the_model_list_names_the_configured_model(serving):

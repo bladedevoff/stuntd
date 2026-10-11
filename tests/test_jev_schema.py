@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from stuntd.jev.schema import JevError, kind_for, parse_request
+from stuntd.jev.schema import JevError, kind_for, laya_question, parse_request
 from stuntd.train.artifacts import site_dir
 
 CHOICE = {"type": "choice", "instructions": "route it", "criteria": {"north": None, "south": "s"}}
@@ -282,3 +282,21 @@ def test_kind_for_refuses_an_unknown_type():
     question = replace(one("spam", NOUL), type="rank")
     with pytest.raises(ValueError, match="'rank'"):
         kind_for(question)
+
+
+@pytest.mark.parametrize("instructions", [None, "", "   ", [], {}])
+def test_a_question_without_instructions_is_asked_to_laya_by_its_name(instructions):
+    canonical = one("needs_human", {"type": "noul", "instructions": instructions}).canonical
+    assert laya_question(canonical, "needs_human") == {
+        "type": "noul",
+        "instructions": "needs_human",
+    }
+
+
+def test_a_question_keeps_its_own_instructions_for_laya():
+    canonical = one("route", CHOICE).canonical
+    assert laya_question(canonical, "route") == {
+        "type": "choice",
+        "instructions": "route it",
+        "criteria": {"north": None, "south": "s"},
+    }

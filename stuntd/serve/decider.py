@@ -35,6 +35,9 @@ _SHOWN_KEYS = 4
 _WARM_TEXT = "user: hello"
 """Stand-in input the warm-up pass runs on, short enough to cost one short sequence."""
 
+_WARM_QUESTION = "Is this a greeting?"
+"""What the zero-shot warm-up asks; laya 0.3.24 and later refuses empty instructions."""
+
 # laya ships no type information, so the agent and everything reached through it is Any, and
 # the row below is the untyped dict its collate function consumes.
 _Row = dict[str, Any]
@@ -119,7 +122,7 @@ class Decider:
 
     def warm_base(self) -> None:
         """Runs one zero-shot pass, so the first Jev caller of a fresh daemon does not pay for it."""
-        self.answer(_WARM_TEXT, {"warm": {"type": "noul", "instructions": "", "criteria": None}})
+        self.answer(_WARM_TEXT, {"warm": {"type": "noul", "instructions": _WARM_QUESTION}})
 
     def _ensure_loaded(self) -> None:
         if self._agent is None:

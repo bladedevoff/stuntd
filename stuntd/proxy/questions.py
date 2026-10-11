@@ -353,7 +353,9 @@ async def _zero_shot(
 ) -> tuple[dict[str, Any], int]:
     if not pending:
         return {}, 0
-    questions = {question.name: laya_question(question.canonical) for question in pending}
+    questions = {
+        question.name: laya_question(question.canonical, question.name) for question in pending
+    }
     # laya answers in its own untyped shape, which the decider passes through as object.
     reply: Any = await to_thread.run_sync(decider.answer, text, questions)
     return reply["answers"], int(reply["usage"]["input_tokens"])

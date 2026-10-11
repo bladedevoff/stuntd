@@ -73,15 +73,16 @@ def kind_for(question: Question) -> str:
     return kind
 
 
-def laya_question(canonical: str) -> dict[str, object]:
-    """A canonical question as laya reads it."""
+def laya_question(canonical: str, name: str) -> dict[str, object]:
+    """A canonical question as laya reads it; one without instructions is asked by its name."""
     parsed = json.loads(canonical)
     instructions = parsed["instructions"]
-    # laya reads instructions without a default, and a noul question may carry no criteria at all.
-    question: dict[str, object] = {
-        "type": parsed["type"],
-        "instructions": "" if instructions is None else instructions,
-    }
+    # The SDK leaves instructions off when the caller did not set them, and laya 0.3.24 and later
+    # refuses a question whose instructions are missing, blank or empty.
+    if not instructions or (isinstance(instructions, str) and not instructions.strip()):
+        instructions = name
+    # A noul question may carry no criteria at all.
+    question: dict[str, object] = {"type": parsed["type"], "instructions": instructions}
     if parsed["criteria"] is not None:
         question["criteria"] = parsed["criteria"]
     return question
